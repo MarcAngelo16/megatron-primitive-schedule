@@ -135,7 +135,8 @@ void ValidateJointOptimizerMechanismOptions(
       incumbent_method != "none" && incumbent_method != "auto" &&
       incumbent_method != "hybrid-slack" && incumbent_method != "uniform" &&
       incumbent_method != "enumerate" && incumbent_method != "cpsat" &&
-      incumbent_method != "fixed") {
+      incumbent_method != "fixed" &&
+      incumbent_method != "heuristic") {
     throw Error("unknown incumbent method: " + incumbent_method);
   }
   if (incumbent_method == "none") {

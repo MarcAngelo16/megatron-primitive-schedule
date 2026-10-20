@@ -72,6 +72,8 @@ struct BfsSplitOptimizationResult {
   ScheduleSolution schedule;
   MachineOrders machine_orders;
   std::string diagnostic;
+  // Versioned diagnostics from the optional Heuristic Algorithm only.
+  std::string heuristic_metadata_json;
   ActivationCapConstraintMetadata activation_cap_constraints;
   double hybrid_min_slack = 0.0;
   std::vector<double> hybrid_stage_scores;

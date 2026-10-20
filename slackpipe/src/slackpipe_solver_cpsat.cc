@@ -54,6 +54,24 @@ constexpr double kReferenceBudgetFraction = kSlackPipePreparationBudgetFraction;
         "exhausted";
     return fallback;
   }
+  if (options.bfs_method == "heuristic") {
+    auto heuristic = options.heuristic_options;
+    heuristic.random_seed = options.random_seed;
+    heuristic.parent_deadline = &deadline;
+    const auto balance = ComputeWorkerBalanceConstraint(instance,
+        options.worker_balance_tolerance_percent, options.worker_balance_tolerance_layers);
+    const auto caller_allowed = heuristic.allowed_partition;
+    heuristic.allowed_partition = [&, balance, caller_allowed](const auto& p) {
+      if (caller_allowed && !caller_allowed(p)) return false;
+      if (balance.enabled)
+        for (Tick load : WorkerLayerTotals(instance, p))
+          if (load < balance.lower_bound || load > balance.upper_bound) return false;
+      return true;
+    };
+    if (options.time_limit_seconds > 0)
+      heuristic.time_limit_seconds = std::min(heuristic.time_limit_seconds, reference_time_limit_seconds);
+    return BuildHeuristicIncumbent(instance, heuristic);
+  }
   const bool timed_auto_hybrid =
       options.time_limit_seconds > 0.0 && options.bfs_method == "auto";
   const bool explicit_hybrid = options.bfs_method == "hybrid-slack";
@@ -194,6 +212,7 @@ SlackPipeResult SolveCanonicalSlackPipe(const Instance& instance,
   joint_options.fifo_ordering = options.fifo_ordering;
   joint_options.symmetry_break_f0_fifo = options.symmetry_break_f0_fifo;
   joint_options.bfs_method = options.bfs_method;
+  joint_options.heuristic_options = options.heuristic_options;
   joint_options.enumeration_threshold = options.enumeration_threshold;
   joint_options.worker_balance_tolerance_percent =
       options.worker_balance_tolerance_percent;
@@ -335,7 +354,9 @@ SlackPipeResult SolveCanonicalSlackPipe(const Instance& instance,
   if (result.bfs.split.empty()) {
     result.bfs = std::move(reference);
   }
-  if (result.bfs.method.find("hybrid-slack") != std::string::npos) {
+  if (result.bfs.method == "heuristic") {
+    result.initial_split_method = result.bfs.method;
+  } else if (result.bfs.method.find("hybrid-slack") != std::string::npos) {
     result.initial_split_method = "hybrid-slack";
   } else if (result.bfs.method.find("uniform") != std::string::npos) {
     result.initial_split_method = "uniform";

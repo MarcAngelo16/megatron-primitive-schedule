@@ -608,7 +608,10 @@ std::string ToJson(const Instance &instance,
   if (result.canonical) {
     out << CanonicalResultTopLevelJsonFields(*result.canonical, "  ", true);
   }
-  out << "  \"algorithm\": \"optimize-bfs\",\n";
+  out << "  \"algorithm\": \"" << (result.method == "heuristic" ? "heuristic" :
+      "optimize-bfs") << "\",\n";
+  if (!result.heuristic_metadata_json.empty())
+    out << "  \"heuristic\": " << result.heuristic_metadata_json << ",\n";
   out << "  \"method\": \"" << JsonEscape(result.method) << "\",\n";
   out << "  \"status\": \"" << JsonEscape(result.status) << "\",\n";
   out << "  \"solver_status_raw\": \""
@@ -636,6 +639,42 @@ std::string ToJson(const Instance &instance,
   out << "  \"branches\": " << result.branches << ",\n";
   out << "  \"conflicts\": " << result.conflicts << ",\n";
   out << "  \"checked_splits\": " << result.checked_splits << ",\n";
+  if (result.method == "heuristic") {
+    out << "  \"ok\": " << (result.schedule.ok() ? "true" : "false") << ",\n"
+        << "  \"reported_status\": \"" << JsonEscape(result.status) << "\",\n"
+        << "  \"hint_budget_seconds\": " << result.hint_budget_seconds << ",\n"
+        << "  \"hint_elapsed_seconds\": " << result.hint_elapsed_seconds << ",\n"
+        << "  \"hint_iterations\": " << result.hint_iterations << ",\n"
+        << "  \"hint_candidates_generated\": " << result.hint_candidates_generated << ",\n"
+        << "  \"hint_candidates_simulated\": " << result.hint_candidates_simulated << ",\n"
+        << "  \"hint_deadline_reached\": " << (result.hint_deadline_reached ? "true" : "false") << ",\n"
+        << "  \"hint_termination_reason\": \"" << JsonEscape(result.hint_termination_reason) << "\",\n";
+    out << "  \"stage_to_worker_mapping\": [";
+    for (Index s = 0; s < instance.stages; ++s) {
+      if (s) out << ", ";
+      out << "{\"stage\": " << s << ", \"worker\": " << instance.WorkerForStage(s) << "}";
+    }
+    out << "],\n";
+    // Self-contained evaluator inputs, not a new calibration profile format.
+    out << "  \"duration_model_ticks\": {";
+    auto array = [&](const char* name, const std::vector<Tick>& values, bool comma) {
+      if (comma) out << ", ";
+      out << '"' << name << "\": [";
+      for (std::size_t k = 0; k < values.size(); ++k) { if (k) out << ", "; out << values[k]; }
+      out << ']';
+    };
+    array("forward_slope", instance.profile_forward_slope_ticks, false);
+    array("backward_slope", instance.profile_backward_slope_ticks, true);
+    array("forward_bias", instance.profile_forward_bias_ticks, true);
+    array("backward_bias", instance.profile_backward_bias_ticks, true);
+    array("prefix_forward", instance.profile_prefix_forward_ticks, true);
+    array("prefix_backward", instance.profile_prefix_backward_ticks, true);
+    array("role_forward_bias", instance.profile_role_forward_bias_ticks, true);
+    array("role_backward_bias", instance.profile_role_backward_bias_ticks, true);
+    out << "},\n"
+        << "  \"cost_profile_hash\": \"" << JsonEscape(instance.cost_profile_hash) << "\",\n"
+        << "  \"cost_profile_schema_version\": \"" << JsonEscape(instance.cost_profile_schema_version) << "\",\n";
+  }
   out << "  \"enumeration_candidates_total\": "
       << result.enumeration_candidates_total << ",\n";
   out << "  \"enumeration_candidates_valid_schedule\": "
@@ -781,6 +820,9 @@ std::string ToJson(const Instance &instance,
   out << "],\n";
   out << "  \"bfs_incumbent_makespan_ticks\": "
       << result.bfs_incumbent.makespan_ticks << ",\n";
+  if (result.bfs_incumbent.method == "heuristic") {
+    out << "  \"early_hint\": " << ToJson(instance, result.bfs_incumbent) << ",\n";
+  }
   out << "  \"improvement_over_bfs_ticks\": ";
   if (result.bfs_incumbent.makespan_ticks > 0) {
     out << result.bfs_incumbent.makespan_ticks - result.makespan_ticks;
@@ -1116,6 +1158,9 @@ std::string ToJson(const Instance &instance, const SlackPipeResult &result) {
   }
   out << "],\n";
   out << "  \"bfs_makespan_ticks\": " << result.bfs.makespan_ticks << ",\n";
+  if (result.bfs.method == "heuristic") {
+    out << "  \"early_hint\": " << ToJson(instance, result.bfs) << ",\n";
+  }
   out << "  \"analytical_global_lower_bound\": "
       << result.analytical_global_lower_bound << ",\n";
   out << "  \"split\": [";

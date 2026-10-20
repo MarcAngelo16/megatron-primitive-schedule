@@ -8,6 +8,7 @@
 #include "slackpipe/bfs_solver.h"
 #include "slackpipe/dag_evaluator.h"
 #include "slackpipe/partition_restriction.h"
+#include "slackpipe/heuristic_hint.h"
 #include "slackpipe/search_stats.h"
 #include "slackpipe/timing.h"
 #include "slackpipe/lifecycle.h"
@@ -33,6 +34,7 @@ struct SlackPipeOptions {
   bool fifo_ordering = true;
   bool symmetry_break_f0_fifo = true;
   std::string bfs_method = "auto";
+  HeuristicHintOptions heuristic_options;
   bool use_bfs_hints = true;
   std::uint64_t enumeration_threshold = 100000;
   double worker_balance_tolerance_percent = -1.0;

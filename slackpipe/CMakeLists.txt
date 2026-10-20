@@ -61,6 +61,7 @@ add_library(slackpipe_core
   src/workload_bound.cc
   src/plan_export.cc
   src/pressure_pruning.cc
+  src/heuristic_hint.cc
   src/result_schema.cc
   src/result_validator.cc
   src/slackpipe_solver.cc
@@ -195,6 +196,7 @@ if(SLACKPIPE_BUILD_TESTS)
     tests/octopipe_tests.cc
     tests/octopipe_diagnostic_tests.cc
     tests/workload_bound_tests.cc
+    tests/heuristic_tests.cc
   )
   if(GTest_FOUND)
     target_link_libraries(slackpipe_core_tests PRIVATE slackpipe_core GTest::gtest_main)
@@ -217,6 +219,11 @@ if(SLACKPIPE_BUILD_TESTS)
     add_test(
       NAME result_validator_cli_tests
       COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/result_validator_cli_test.py $<TARGET_FILE:slackpipe_cli>
+    )
+    add_test(
+      NAME heuristic_cli_tests
+      COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/heuristic_cli_test.py
+              $<TARGET_FILE:slackpipe_cli>
     )
   endif()
 endif()

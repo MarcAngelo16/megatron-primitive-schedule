@@ -187,7 +187,7 @@ void PrintHelp() {
       << "                                  "
          "sequential-partition-then-schedule,\n"
       << "                                  alternating-partition-schedule, "
-         "slackpipe, octopipe-algorithm1-fixed-stage\n"
+         "slackpipe, heuristic, octopipe-algorithm1-fixed-stage\n"
       << "  --octopipe-max-iterations INT    deterministic tuning limit (0: unlimited)\n"
       << "  --octopipe-candidates-per-iteration INT  F/B edit limit (default 64)\n"
       << "  --octopipe-fixed-placement BOOL disable whole-stage swaps (default false)\n"
@@ -198,9 +198,9 @@ void PrintHelp() {
       << "                                  fixed-order partition backend: "
          "auto, enumerate, cpsat\n"
       << "  --bfs-method NAME               incumbent method: auto, "
-         "hybrid-slack,\n"
+         "heuristic, hybrid-slack,\n"
       << "                                  uniform, enumerate, cpsat\n"
-      << "  --incumbent-method NAME         external incumbent: slack, "
+      << "  --incumbent-method NAME         external incumbent: heuristic, slack, "
          "canonical, none\n"
       << "  --incumbent-bound on|off        use incumbent as CP-SAT horizon "
          "bound\n"
@@ -213,6 +213,13 @@ void PrintHelp() {
       << "  --time-limit-seconds FLOAT      CP-SAT time limit per solve\n"
       << "  --num-workers INT               CP-SAT parallel search workers\n"
       << "  --random-seed INT               CP-SAT random seed\n"
+      << "  --heuristic-time-limit-seconds FLOAT  default 60; shared with global budget\n"
+      << "  --heuristic-evaluation-limit INT  full search replay limit, default 100000000\n"
+      << "  --heuristic-refinement NAME    coupled (only supported mode)\n"
+      << "  --heuristic-fixed-evaluations BOOL  deterministic standalone test mode, ignores wall deadlines\n"
+      << "  --heuristic-verify-replay BOOL  debug cross-check against general evaluator\n"
+      << "  --heuristic-trace PATH         standalone diagnostics and acceptance trace JSON\n"
+      << "  Early hints: --incumbent-method heuristic (joint) / --bfs-method heuristic (SlackPipe)\n"
       << "  --require-optimal BOOL          reject non-optimal solver result\n"
       << "  --log-search-progress BOOL      enable CP-SAT search logging\n"
       << "  --enumeration-threshold INT     split enumeration threshold\n"
@@ -543,6 +550,7 @@ int main(int argc, char **argv) {
   std::string fixed_partition_source;
   std::string output_prefix;
   std::string emit_plan_path;
+  std::string heuristic_trace_path;
   std::string cost_profile_path;
   std::string algorithm = "eval-bfs";
   std::string method = "auto";
@@ -661,6 +669,25 @@ int main(int argc, char **argv) {
         options.num_workers = std::stoi(ValueAfter(i, argc, argv));
         joint_options.num_workers = options.num_workers;
         slackpipe_options.num_workers = options.num_workers;
+      } else if (flag == "--heuristic-time-limit-seconds") {
+        joint_options.heuristic_options.time_limit_seconds = std::stod(ValueAfter(i, argc, argv));
+        slackpipe_options.heuristic_options = joint_options.heuristic_options;
+      } else if (flag == "--heuristic-evaluation-limit") {
+        joint_options.heuristic_options.evaluation_limit = std::stoll(ValueAfter(i, argc, argv));
+        slackpipe_options.heuristic_options = joint_options.heuristic_options;
+      } else if (flag == "--heuristic-refinement") {
+        joint_options.heuristic_options.refinement_mode = ValueAfter(i, argc, argv);
+        slackpipe_options.heuristic_options = joint_options.heuristic_options;
+      } else if (flag == "--heuristic-fixed-evaluations") {
+        joint_options.heuristic_options.fixed_evaluation_test = ParseBool(ValueAfter(i, argc, argv));
+        slackpipe_options.heuristic_options = joint_options.heuristic_options;
+      } else if (flag == "--heuristic-verify-replay") {
+        joint_options.heuristic_options.verify_cached_replay = ParseBool(ValueAfter(i, argc, argv));
+        slackpipe_options.heuristic_options = joint_options.heuristic_options;
+      } else if (flag == "--heuristic-trace") {
+        heuristic_trace_path = ValueAfter(i, argc, argv);
+        joint_options.heuristic_options.record_trace = true;
+        slackpipe_options.heuristic_options = joint_options.heuristic_options;
       } else if (flag == "--random-seed") {
         options.random_seed = std::stoi(ValueAfter(i, argc, argv));
         joint_options.random_seed = options.random_seed;
@@ -797,9 +824,10 @@ int main(int argc, char **argv) {
       } else if (flag == "--incumbent-method") {
         const std::string incumbent_method = ValueAfter(i, argc, argv);
         if (incumbent_method != "slack" && incumbent_method != "canonical" &&
-            incumbent_method != "none") {
+            incumbent_method != "none" &&
+            incumbent_method != "heuristic") {
           throw slackpipe::Error(
-              "--incumbent-method must be slack, canonical, or none");
+              "--incumbent-method must be heuristic, slack, canonical, or none");
         }
         joint_options.incumbent_method = incumbent_method;
         incumbent_method_provided = true;
@@ -1237,6 +1265,44 @@ int main(int argc, char **argv) {
                              fixed_partition_source);
     };
 
+    if (!heuristic_trace_path.empty() && algorithm != "heuristic")
+      throw slackpipe::Error("--heuristic-trace is standalone-only; embedded hints retain summary metadata");
+    if (algorithm == "heuristic") {
+      if (!split.empty() || activation_options.enforce_activation_cap ||
+          !joint_options.fifo_ordering || slackpipe_options.pressure_pruning.enabled ||
+          options.num_workers != 1 || !fixed_partition_source.empty())
+        throw slackpipe::Error("standalone heuristic requires uniform start, FIFO, one search thread, no activation cap/pressure pruning");
+      auto heuristic = joint_options.heuristic_options;
+      heuristic.partition_restriction = slackpipe::MakePartitionRestriction(
+          instance, slackpipe::UniformSplit(instance), slackpipe_options);
+      heuristic.random_seed = options.random_seed;
+      if (options.time_limit_seconds > 0)
+        heuristic.time_limit_seconds = std::min(heuristic.time_limit_seconds, options.time_limit_seconds);
+      const auto balance = slackpipe::ComputeJointWorkerBalanceConstraint(instance, joint_options);
+      if (balance.enabled) heuristic.allowed_partition = [&, balance](const auto& p) {
+        for (auto load : slackpipe::WorkerLayerTotals(instance, p))
+          if (load < balance.lower_bound || load > balance.upper_bound) return false;
+        return true;
+      };
+      auto result = slackpipe::BuildHeuristicIncumbent(instance, heuristic);
+      const auto validation = slackpipe::ValidateScheduleSolutionIndependent(
+          instance, result.schedule, result.status, "heuristic");
+      if (!validation.passed) return invalid_result_exit(validation);
+      slackpipe::WriteTextFile(output_prefix + ".json", slackpipe::ToJson(instance, result));
+      slackpipe::WriteTextFile(output_prefix + ".csv", slackpipe::ToCsv(instance, result.schedule));
+      slackpipe::WriteTextFile(output_prefix + ".orders.txt", slackpipe::ToOrdersText(instance, result.machine_orders));
+      slackpipe::WriteTextFile(output_prefix + ".svg", slackpipe::ToSvg(instance, result.schedule));
+      if (!heuristic_trace_path.empty())
+        slackpipe::WriteTextFile(heuristic_trace_path, result.heuristic_metadata_json);
+      emit_plan_after_validation(result.schedule, result.status);
+      dump_interleavings(result.schedule, {result.status, result.makespan_ticks, std::nullopt});
+      std::cout << "method=heuristic status=" << result.status << " makespan=" << result.makespan_ticks
+                << " search_seconds=" << result.wall_time_seconds
+                << " evaluations=" << result.hint_candidates_simulated
+                << " stop=" << result.hint_termination_reason << "\n";
+      finish_search_stats();
+      return finish(0);
+    }
     if (algorithm == "octopipe-algorithm1-fixed-stage") {
       if (!joint_options.fifo_ordering || activation_options.enforce_activation_cap ||
           slackpipe_options.pressure_pruning.enabled ||

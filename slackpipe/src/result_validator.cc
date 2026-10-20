@@ -612,6 +612,23 @@ ResultValidationInput InputFromJson(const JsonValue& root) {
       FieldTick(source, "communication_ticks")
           .value_or(FieldTick(root, "communication_ticks").value_or(0));
 
+  if (const auto* costs = root.Find("duration_model_ticks")) {
+    if (costs->type != JsonValue::Type::kObject) throw Error("invalid duration_model_ticks");
+    auto required = [&](const char* name) {
+      auto values = FieldTickArray(*costs, name);
+      if (!values) throw Error(std::string("missing duration_model_ticks.") + name);
+      return *values;
+    };
+    input.instance.profile_forward_slope_ticks = required("forward_slope");
+    input.instance.profile_backward_slope_ticks = required("backward_slope");
+    input.instance.profile_forward_bias_ticks = required("forward_bias");
+    input.instance.profile_backward_bias_ticks = required("backward_bias");
+    input.instance.profile_prefix_forward_ticks = required("prefix_forward");
+    input.instance.profile_prefix_backward_ticks = required("prefix_backward");
+    input.instance.profile_role_forward_bias_ticks = required("role_forward_bias");
+    input.instance.profile_role_backward_bias_ticks = required("role_backward_bias");
+  }
+
   input.communication_model = FieldString(source, "communication_model")
                                   .value_or(input.communication_model);
   if (forward_den != 1 || backward_den != 1) {

@@ -597,6 +597,27 @@ void RequireValidBfsIncumbentForUse(
         incumbent, "canonical joint incumbent accepted structurally");
   }
 
+  if (build_method == "heuristic") {
+    auto heuristic = options.heuristic_options;
+    heuristic.random_seed = options.random_seed;
+    heuristic.parent_deadline = &deadline;
+    heuristic.partition_restriction = options.partition_restriction;
+    const auto balance = ComputeJointWorkerBalanceConstraint(instance, options);
+    const auto caller_allowed = heuristic.allowed_partition;
+    heuristic.allowed_partition = [&, balance, caller_allowed](const auto& p) {
+      if (caller_allowed && !caller_allowed(p)) return false;
+      if (balance.enabled)
+        for (Tick load : WorkerLayerTotals(instance, p))
+          if (load < balance.lower_bound || load > balance.upper_bound) return false;
+      return true;
+    };
+    if (options.time_limit_seconds > 0)
+      heuristic.time_limit_seconds = std::min(heuristic.time_limit_seconds, incumbent_effective_budget_seconds);
+    auto incumbent = BuildHeuristicIncumbent(instance, heuristic);
+    RequireValidBfsIncumbentForUse(instance, &incumbent, options.partition_restriction,
+                                  "heuristic incumbent failed validation");
+    return maybe_replace_cap_violating_incumbent(incumbent, "heuristic incumbent accepted structurally");
+  }
   const bool timed_auto_hybrid =
       options.time_limit_seconds > 0.0 && build_method == "auto";
   const bool explicit_hybrid = build_method == "hybrid-slack";
@@ -708,6 +729,7 @@ void RequireValidBfsIncumbentForUse(
 [[nodiscard]] std::string IncumbentSourceName(const std::string& method,
                                               bool override) {
   if (method.empty()) return "none";
+  if (method == "heuristic") return override ? "heuristic_incumbent_override" : "heuristic_incumbent";
   if (method == "schedule-only-hint") return "schedule_only_fixed_partition";
   if (method == "deterministic-uniform-bfs-fallback") {
     return "deterministic_uniform_breadth_first_incumbent";

@@ -10,6 +10,7 @@
 #include "slackpipe/lifecycle.h"
 #include "slackpipe/partition_restriction.h"
 #include "slackpipe/pressure_pruning.h"
+#include "slackpipe/heuristic_hint.h"
 #include "slackpipe/result_schema.h"
 #include "slackpipe/timing.h"
 #include "slackpipe/worker_balance.h"
@@ -25,6 +26,7 @@ struct JointOptimizerOptions {
   bool fifo_ordering = true;
   bool symmetry_break_f0_fifo = true;
   std::string bfs_method = "auto";
+  HeuristicHintOptions heuristic_options;
   std::uint64_t enumeration_threshold = 100000;
   bool use_bfs_hints = true;
   std::optional<bool> worker_balance_pruning;

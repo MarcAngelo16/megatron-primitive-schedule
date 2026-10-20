@@ -75,6 +75,18 @@ The core C++ tests cover operation-position indexing, per-position FIFO,
 worker-local `R_N` predecessor validation, pruned `pred_N` candidate helper
 scope, and canonical evaluation-result schema serialization.
 
+## Coupled Heuristic Early Hints
+
+`--algorithm heuristic` runs the independent Heuristic Algorithm without
+OR-Tools. It uses structured initialization followed by single-parent coupled
+partition/order refinement. Only `coupled` refinement is supported.
+Select it explicitly with `--incumbent-method heuristic` for joint CP-SAT
+or `--bfs-method heuristic` for SlackPipe; existing defaults are unchanged.
+
+See [Heuristic Algorithm](docs/heuristic.md) for search semantics, budget
+accounting, diagnostics, tests and executable Docker examples. A returned
+`FEASIBLE` schedule is not an optimality proof or a GPU performance measurement.
+
 ## Megatron Plan Export
 
 `--emit-plan PATH` exports the evaluator-validated native worker orders as
