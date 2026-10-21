@@ -1,5 +1,13 @@
 # OctoPipe Algorithm-1 Fixed-Stage Baseline
 
+> Historical implementation/experiment record. The current public method is
+> `octopipe-tuning`, with cyclic placement fixed in formal comparisons. The
+> commands, aliases, registry entries and test counts below describe the earlier
+> checkout; they are not current reproduction instructions. Use
+> [the five-method guide](slackpipe_five_methods.md) for current commands.
+> The forced-phase diagnostic remains available as a diagnostic only; its
+> offline interleaved initializer is not a native Megatron baseline.
+
 **This is NOT a full reproduction of OctoPipe.** It implements the phase-selection
 control logic of [Algorithm 1 in OctoPipe, arXiv:2509.23722v3](https://arxiv.org/html/2509.23722v3)
 using SlackPipe's C++ representation, cost model, and evaluator. Makespans are

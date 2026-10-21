@@ -10,7 +10,7 @@
 #include "slackpipe/plan_export.h"
 #include "slackpipe/result_schema.h"
 #include "slackpipe/result_validator.h"
-#include "slackpipe/slackpipe_solver.h"
+#include "slackpipe/instance.h"
 
 namespace {
 using namespace slackpipe;
@@ -229,13 +229,14 @@ TEST(OctoPipe, ExplicitPlacementRoundTripsThroughCommonResultValidator) {
   i.stage_to_worker = {0, 0, 1, 1};
   const auto s = EvaluateOctoPipeCandidate(i, {1, 1, 2, 4}, BreadthFirstOrders(i))->schedule;
   EXPECT_TRUE(WorkerLayerTotals(i, s.split) == (std::vector<Tick>{2, 6}));
-  EXPECT_TRUE(StagesOnWorkers(i) == (std::vector<std::vector<Index>>{{0, 1}, {2, 3}}));
-  CanonicalSemantics semantics;
-  semantics.canonical_method = "octopipe-algorithm1-fixed-stage";
-  const auto metadata = BuildCanonicalResultMetadata(i, {}, semantics,
-      OutcomeFromSchedule(s, "FEASIBLE"), s.split, s.orders);
-  EXPECT_TRUE(ValidateResultJsonText(ToJson(i, s, metadata)).passed);
-  EXPECT_TRUE(ValidationInputFromResultJsonText(ToJson(i, s, metadata)).instance.stage_to_worker ==
+  SearchResult result;
+  result.method = "octopipe-tuning";
+  result.status = "FEASIBLE";
+  result.schedule = s;
+  result.makespan_ticks = s.makespan;
+  result.final_solution_available = true;
+  EXPECT_TRUE(ValidateResultJsonText(ToJson(i, result)).passed);
+  EXPECT_TRUE(ValidationInputFromResultJsonText(ToJson(i, result)).instance.stage_to_worker ==
               i.stage_to_worker);
   i.stage_to_worker = {0, 2, 0, 1};
   EXPECT_THROW(i.Validate(), Error);

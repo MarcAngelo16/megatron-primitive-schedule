@@ -1,27 +1,22 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""Synthetic raw timings model the reported LLaMA spikes, not GPU measurements."""
+"""Synthetic operation residuals, not GPU measurements or stability acceptance tests."""
 
 import copy
 import json
-from dataclasses import replace
-from unittest.mock import Mock
 
 import pytest
 
 from megatron.core.pipeline_parallel.slackpipe.cost_profile import build_cost_profile
-from megatron.core.pipeline_parallel.slackpipe.profile_quality import (
-    ProfilingQualityError,
-    QualityThresholds,
-    assess_profile,
+from megatron.core.pipeline_parallel.slackpipe.profile_integrity import (
     publish_profile,
-    require_profile_quality,
     tag_calibration_events,
+    validate_profile_integrity,
 )
-from tools.slackpipe_profile_quality import collect_with_retry
+from megatron.core.pipeline_parallel.slackpipe.stage_residual import ResidualPolicy
 
 
 def raw_profile(
-    root, spikes=(), *, stages=8, iterations=30, microbatches=8, thresholds=None, normal=None
+    root, spikes=(), *, stages=8, iterations=30, microbatches=8, policy=None, normal=None
 ):
     """Generate one tagged calibration group with independent stage/phase clocks."""
     events = []
@@ -61,7 +56,7 @@ def raw_profile(
         num_microbatches=microbatches,
         iteration_start=5,
         iteration_end=5 + iterations - 1,
-        quality_thresholds=thresholds or QualityThresholds(),
+        residual_policy=policy or ResidualPolicy(),
     )
     assert events == original
     return profile, events
@@ -69,8 +64,8 @@ def raw_profile(
 
 def test_stable_data_preserves_estimator(tmp_path):
     profile, _ = raw_profile(tmp_path)
-    report = assess_profile(profile)
-    assert report["status"] == "passed" and report["samples_discarded"] == 0
+    validate_profile_integrity(profile)
+    assert profile["residual_filter"]["phases"]["forward"]["applied_excluded_count"] == 0
     assert profile["a_fwd"] == 10 and profile["a_bwd"] == 20
     assert profile["bias_fwd"] == [0] * 8
     assert profile["observed_stages"][0]["forward_diagnostics"]["samples_ms"] == [80] * 30
@@ -81,54 +76,41 @@ def test_one_spike_before_iteration_mean_and_raw_unchanged(tmp_path):
     raw = tmp_path / "raw.json"
     raw.write_text(json.dumps(events))
     original = raw.read_bytes()
-    report = publish_profile(tmp_path / "cost_profile.json", profile)
+    publish_profile(tmp_path / "cost_profile.json", profile)
     assert raw.read_bytes() == original
-    group = next(g for g in report["sample_groups"] if g["stage"] == 4 and g["phase"] == "forward")
-    assert (
-        group["raw_sample_count"],
-        group["accepted_sample_count"],
-        group["samples_discarded"],
-    ) == (240, 239, 1)
-    assert group["discarded_fraction"] == pytest.approx(1 / 240)
-    assert group["raw_cv"] > 0.5 and group["cleaned_cv"] == 0
-    assert report["status"] == "passed" and report["samples_discarded"] == 1
-    rejected = report["rejected_samples"][0]
-    assert (rejected["iteration"], rejected["microbatch"], rejected["elapsed_ms"]) == (6, 5, 356)
-    assert rejected["median"] == 10 and rejected["MAD"] == 0
-    assert rejected["robust_sigma"] == 0 and rejected["threshold_ms"] == 30
+    phase = profile["residual_filter"]["phases"]["forward"]
+    assert phase["applied_excluded_count"] == 1
+    rejected = next(s for s in phase["samples"] if s["applied_excluded"])
+    assert (rejected["iteration"], rejected["microbatch"], rejected["observed_ms"]) == (6, 5, 356)
+    assert rejected["prediction_ms"] == 10
+    assert rejected["relative_residual"] == pytest.approx(34.6)
+    assert phase["initial_residual_scaled_mad"] == 0
     assert rejected["raw_data_path"] == str(raw.resolve())
     row = profile["observed_stages"][4]
     assert row["forward_ms_per_op"] == 10
     assert row["forward_diagnostics"]["samples_ms"][1] == 80
     assert row["forward_diagnostics"]["accepted_counts_by_iteration"][1] == 7
-    require_profile_quality(profile)
+    assert row["forward_diagnostics"]["raw_sample_count"] == 240
+    assert row["forward_diagnostics"]["accepted_sample_count"] == 239
+    assert (
+        profile["raw_observed_stages"][4]["forward_diagnostics"]["raw_events"][13]["elapsed_ms"]
+        == 356
+    )
 
 
-def test_reported_llama_pattern_passes_without_retry(tmp_path):
+def test_reported_synthetic_pattern_is_filtered_only_by_residual(tmp_path):
     spikes = [
         (4, "forward", 13, 356),
         (2, "forward", 50, 313),
         (5, "forward", 57, 306),
         (3, "forward", 98, 286),
     ]
-    calls = []
-
-    def collect(worker, attempt):
-        calls.append(attempt)
-        profile, _ = raw_profile(worker, spikes)
-        publish_profile(worker / "cost_profile.json", profile, attempt=attempt)
-
-    selected = collect_with_retry(tmp_path, collect, {})
-    assert calls == [0]
-    profile = json.loads(selected.read_text())
-    assert profile["quality"]["samples_discarded"] == 4
-    assert not profile["quality"]["issues"]
-    assert all(g["cleaned_cv"] == 0 for g in profile["quality"]["sample_groups"])
-    assert all(
-        g["samples_discarded"] == 0
-        for g in profile["quality"]["sample_groups"]
-        if g["phase"] == "backward"
-    )
+    profile, _ = raw_profile(tmp_path, spikes)
+    phases = profile["residual_filter"]["phases"]
+    assert phases["forward"]["applied_excluded_count"] == 4
+    assert phases["backward"]["applied_excluded_count"] == 0
+    assert "quality" not in profile
+    validate_profile_integrity(profile)
 
 
 def test_rare_multiple_spikes_and_nonzero_mad(tmp_path):
@@ -137,64 +119,46 @@ def test_rare_multiple_spikes_and_nonzero_mad(tmp_path):
         [(0, "forward", i, 310) for i in (13, 50, 98, 170)],
         normal=lambda s, p, i: (10 if p == "forward" else 20) + (i % 3 - 1) * 0.1,
     )
-    report = assess_profile(profile)
-    assert report["status"] == "passed" and report["samples_discarded"] == 4
-    assert all(r["MAD"] > 0 for r in report["rejected_samples"])
+    phase = profile["residual_filter"]["phases"]["forward"]
+    assert phase["applied_excluded_count"] == 4
+    assert phase["initial_residual_scaled_mad"] > 0
 
 
-def test_moderate_variation_is_not_trimmed(tmp_path):
+def test_moderate_variation_is_not_trimmed_or_rejected(tmp_path):
     profile, _ = raw_profile(tmp_path, normal=lambda s, p, i: 9 + (i // 8 % 5))
-    report = assess_profile(profile)
-    assert report["samples_discarded"] == 0
-    assert any(i["rule"] == "within_group_cv" for i in report["issues"])
-    assert report["status"] == "rerun_required"
+    assert all(
+        p["applied_excluded_count"] == 0 for p in profile["residual_filter"]["phases"].values()
+    )
+    publish_profile(tmp_path / "cost_profile.json", profile)
+    assert profile["a_fwd"] == 11
 
 
-@pytest.mark.parametrize("spike,spread", [(25, 0), (35, 2)])
-def test_both_catastrophic_thresholds_must_be_exceeded(tmp_path, spike, spread):
+@pytest.mark.parametrize("spike,spread", [(15, 0), (25, 2)])
+def test_both_residual_conditions_must_be_exceeded(tmp_path, spike, spread):
     profile, _ = raw_profile(
         tmp_path,
         [(0, "forward", 13, spike)],
         normal=lambda s, p, i: 10 + (spread if i % 2 else -spread),
     )
-    # 25 exceeds MAD-only (10), not ratio (30); 35 exceeds ratio,
-    # not MAD-only (39.652). Neither may be removed.
-    assert assess_profile(profile)["samples_discarded"] == 0
+    # rho equality fails the strict test; in the other case the MAD condition fails.
+    assert profile["residual_filter"]["phases"]["forward"]["applied_excluded_count"] == 0
 
 
 @pytest.mark.parametrize(
-    "spikes,kwargs,rule",
+    "indices,kwargs",
     [
-        ([1, 25, 49, 73, 97], {}, "discarded_fraction"),
-        ([13, 14], {}, "max_consecutive_outliers"),
-        ([7, 8], {}, "max_consecutive_outliers"),
-        ([0, 100, 200, 300, 400, 500, 600], {"microbatches": 100}, "affected_iteration_fraction"),
+        ([1, 25, 49, 73, 97], {}),
+        ([13, 14], {}),
+        ([7, 8], {}),
+        ([0, 100, 200, 300, 400, 500, 600], {"microbatches": 100}),
     ],
 )
-def test_systemic_patterns_rejected(tmp_path, spikes, kwargs, rule):
-    profile, _ = raw_profile(tmp_path, [(0, "forward", i, 310) for i in spikes], **kwargs)
-    report = assess_profile(profile)
-    assert report["status"] == "rerun_required"
-    assert any(issue["rule"] == rule for issue in report["issues"])
-
-
-@pytest.mark.parametrize("retry_passes", [True, False])
-def test_systemic_failure_retries_only_once(tmp_path, retry_passes):
-    calls, solver = [], Mock()
-
-    def collect(worker, attempt):
-        calls.append(attempt)
-        spikes = [13] if attempt and retry_passes else [13, 14]
-        profile, _ = raw_profile(worker, [(0, "forward", i, 310) for i in spikes])
-        publish_profile(worker / "cost_profile.json", profile, attempt=attempt)
-
-    with pytest.warns(RuntimeWarning, match="Profiling measurements are inconsistent"):
-        if retry_passes:
-            solver(collect_with_retry(tmp_path, collect, {}))
-        else:
-            with pytest.raises(ProfilingQualityError, match="retry exhausted"):
-                solver(collect_with_retry(tmp_path, collect, {}))
-    assert calls == [0, 1] and solver.call_count == int(retry_passes)
+def test_systemic_pattern_limits_are_not_acceptance_gates(tmp_path, indices, kwargs):
+    profile, _ = raw_profile(tmp_path, [(0, "forward", i, 310) for i in indices], **kwargs)
+    phase = profile["residual_filter"]["phases"]["forward"]
+    assert phase["applied_excluded_count"] == len(indices)
+    assert phase["mask_passes"] == phase["refit_attempts"] == 1
+    publish_profile(tmp_path / "cost_profile.json", profile)
 
 
 def test_stage_and_phase_isolation(tmp_path):
@@ -203,35 +167,32 @@ def test_stage_and_phase_isolation(tmp_path):
         [(0, "forward", 13, 310)],
         normal=lambda s, p, i: 100 if s == 7 or p == "backward" else 10,
     )
-    report = assess_profile(profile)
-    assert report["samples_discarded"] == 1 and report["status"] == "passed"
+    assert profile["residual_filter"]["phases"]["forward"]["applied_excluded_count"] == 1
+    assert profile["residual_filter"]["phases"]["backward"]["applied_excluded_count"] == 0
     assert profile["observed_stages"][7]["forward_ms_per_op"] == 100
     assert profile["observed_stages"][0]["backward_ms_per_op"] == 100
 
 
-def test_changed_policy_cannot_reuse_filtered_observations(tmp_path):
-    profile, _ = raw_profile(tmp_path, [(0, "forward", 13, 310)])
-    report = assess_profile(profile, replace(QualityThresholds(), outlier_median_multiplier=4))
-    assert any(i["rule"] == "outlier_policy_match" for i in report["issues"])
+def test_changed_policy_is_explicit_and_does_not_rewrite_raw_samples(tmp_path):
+    first, events = raw_profile(tmp_path, [(0, "forward", 13, 20)])
+    second, same_events = raw_profile(
+        tmp_path, [(0, "forward", 13, 20)], policy=ResidualPolicy(rho=1.1)
+    )
+    assert events == same_events
+    assert first["profiling_policy"] != second["profiling_policy"]
+    assert first["residual_filter"]["phases"]["forward"]["applied_excluded_count"] == 1
+    assert second["residual_filter"]["phases"]["forward"]["applied_excluded_count"] == 0
 
 
-def test_insufficient_raw_samples_never_filter(tmp_path):
+def test_few_raw_samples_have_no_minimum_stability_gate(tmp_path):
     profile, _ = raw_profile(tmp_path, [(0, "forward", 1, 310)], iterations=3, microbatches=4)
-    report = assess_profile(profile)
-    assert report["samples_discarded"] == 0 and report["status"] == "rerun_required"
+    assert profile["residual_filter"]["phases"]["forward"]["applied_excluded_count"] == 1
+    validate_profile_integrity(profile)
 
 
 @pytest.mark.parametrize(
-    "policy",
-    [
-        {"outlier_median_multiplier": 1},
-        {"outlier_mad_multiplier": float("nan")},
-        {"max_outlier_fraction": -0.1},
-        {"max_outlier_iteration_fraction": 1.1},
-        {"max_consecutive_outliers": 0},
-        {"min_outlier_samples": 2},
-    ],
+    "policy", [{"k": 0}, {"k": float("nan")}, {"rho": -0.1}, {"rho": float("inf")}]
 )
 def test_invalid_policy(policy):
     with pytest.raises(ValueError):
-        QualityThresholds(**policy)
+        ResidualPolicy(**policy)

@@ -120,8 +120,8 @@ def hybrid_provider(pattern):
 @pytest.mark.parametrize("pp", [1, 2, 4])
 @pytest.mark.parametrize("precision", ["fp32", "bf16"])
 def test_hybrid_numerical_equivalence(tmp_path, pp, monkeypatch, precision):
-    if pp == 4 and torch.cuda.device_count() < 4:
-        pytest.skip("requires 4 CUDA GPUs")
+    # Single-node fixture: TP=DP=CP=1, one process/device per physical PP rank.
+    Utils.require_cuda_devices(pp)
     if int(os.environ.get("WORLD_SIZE", "1")) != pp:
         pytest.skip(f"requires {pp} ranks")
     torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", "0")))

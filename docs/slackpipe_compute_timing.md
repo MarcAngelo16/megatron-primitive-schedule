@@ -27,7 +27,7 @@ reads add small, unquantified overhead, not new synchronization boundaries.
 
 Native P2P waits on Work handles and, when `batch_p2p_comm && batch_p2p_sync`,
 performs its own device synchronization. Those existing behaviors are unchanged.
-Calibration constructs no torch profiler. There is no profiler wait/active/repeat
+Default calibration constructs no torch profiler. There is no profiler wait/active/repeat
 or flush transition in this path. Each partition receives full-step warmup;
 cache clearing occurs between partitions, outside timed compute closures.
 
@@ -57,6 +57,169 @@ device drain does not retroactively extend individual event intervals.
 P2P host duration, GPU envelopes and drain time cannot be added as disjoint work.
 Fine-grained NCCL wait, allocator and kernel attribution still requires a trace
 or additional focused instrumentation.
+
+## Overlap and Serialized Control
+
+Two worker-only flags extend the diagnostic, without changing the estimator,
+filtering, quality thresholds, ordinary calibration or benchmark/runtime:
+
+- `--diagnostic-timeline`: CPU and CUDA activity, shapes/stack/memory profiling
+  disabled. One continuous raw Kineto capture **per partition and rank**, covering
+  all training warmup and measured iterations. No scheduled cycles are dropped;
+  serialization happens after the partition's entire measurement window. This
+  can produce large files and perturb CPU dispatch. Compare both modes with the
+  same setting; optionally repeat both without tracing as a perturbation check.
+- `--diagnostic-execution serialized`: intentionally synchronize the device
+  before recording each compute start event and after its end event. Complete
+  native P2P before proceeding. This supports **blocking batch P2P with native
+  batch synchronization only**; asynchronous unmatched receives are rejected
+  before launch to avoid deadlock. There are no cross-rank per-operation barriers.
+  This isolates preceding pipeline work on the local GPU, not other processes,
+  kernel-internal concurrency, clocks or thermal/power state.
+- `--diagnostic-nvtx`: independent NVTX operation/step/P2P labels and native
+  timing-event handles, for an **external** Nsight Systems capture. It does not
+  construct a torch profiler. Do not combine CUPTI collectors; omit
+  `--diagnostic-timeline` when using Nsight.
+
+All require `--diagnose-compute-timing`. Normal execution adds no per-operation
+sync. Full-step warmup uses the selected diagnostic policy, including optimizer
+and the same profiler. No profile is fitted or passed to a solver in either mode.
+Native batch P2P already synchronizes in the current configuration: the name
+"normal" does **not** assert that communication overlap was enabled.
+
+Using the four-GPU `launcher` and `common` arrays from Target Reproduction:
+
+```bash
+"${launcher[@]}" "${common[@]}" --diagnose-compute-timing \
+  --diagnostic-timeline --diagnostic-execution normal --run-id overlap-normal \
+  --output slackpipe_experiments/overlap-pair/normal
+"${launcher[@]}" "${common[@]}" --diagnose-compute-timing \
+  --diagnostic-timeline --diagnostic-execution serialized --run-id overlap-serial \
+  --output slackpipe_experiments/overlap-pair/serialized
+docker exec -w /workspace/Megatron-LM slackpipe-dev /opt/venv/bin/python \
+  -m tools.slackpipe_analyze_overlap \
+  --normal slackpipe_experiments/overlap-pair/normal \
+  --serialized slackpipe_experiments/overlap-pair/serialized \
+  --output slackpipe_experiments/overlap-pair/comparison.json
+```
+
+Use 30 measured iterations and 20 full-step warmups, identical hardware,
+configuration, partitions and checkout. Preserve original runs. The report
+rejects differing source/configuration, missing ranks or operations, mismatched
+ranges/composition and mismatched trace settings. Inputs are SHA256-hashed.
+
+Raw `overlap.<run-id>.<execution>.rank<rank>.json` files retain CUDA runtime/driver
+APIs, kernels, NCCL, allocation calls, stream/correlation IDs and Kineto clock
+metadata. Operation labels use `ScheduleTrace/F|B/i<iteration>/s<stage>/b<batch>`;
+P2P labels include iteration and dispatch position. These are torch profiler
+annotations, not a claim that separate Nsight NVTX capture was performed.
+For a follow-up dependency capture, the installed `nsys profile --help` supports
+`--trace=cuda,nvtx --cuda-event-trace=true --sample=none`. Place `nsys profile`
+inside Docker before the torchrun Python command, select `--diagnostic-nvtx`,
+and use a fresh output directory/report name. Device event tracing requires
+CUDA driver 12.8 or newer according to that CLI and can itself introduce overhead
+and false stream dependencies. Check the target's help/driver and interpret this
+as another controlled diagnostic, not a benchmark or automatic causality test.
+No Nsight dependency report for the four-GPU target has been collected here.
+
+`slackpipe.overlap_diagnostic.v1` contains:
+
+- `groups`: every partition/stage/phase, median and CV of all per-iteration
+  microbatch means for normal/serialized `wall_ms` and `compute_gpu_ms`.
+- `cross_partition`: max(median)/min(median)-1 for **identical** stage, ordered
+  composition/range, role, worker and configuration only; null for one group.
+- `normal_operations`, `serialized_operations`: all samples, co-resident stages
+  and ranges, neighboring compute/P2P operations and per-operation evidence.
+- `overlap_evidence`: correlated GPU envelope and union, internal gaps, overlapping
+  NCCL union (no double counting), earlier P2P launch attribution, co-resident
+  stage GPU activity, individual compute activities and allocation API totals.
+  `nccl_simultaneous_compute_union_us` separately counts intersections with
+  associated compute activities, rather than overlap with envelope gaps.
+  Raw trace hashes preserve access to all other events and metadata.
+
+**Boundary caveats:** `wall_ms` in normal mode is asynchronous host closure time;
+serialized `wall_ms` includes completion (pre-drain excluded). They are labeled
+explicitly and must not be compared as identical latency estimators. Normal
+`existing_stage_wall_ms` remains null: obtaining synchronous wall latency in the
+same operation would destroy the overlap being investigated. CUDA events in both
+modes remain stream envelopes, not pure compute time.
+
+Kineto does not expose the device timestamps of our timing event pair. NCCL and
+co-resident overlap are therefore reported against the **correlated GPU activity
+envelope**, not fabricated event bounds. Missing overlap there does not prove no
+overlap in the unobserved boundary gaps. `cuda_event_minus_gpu_envelope_ms`
+exposes this discrepancy without rescaling. `stream_wait_api_candidates` retain
+calls launched during the CPU operation (including engine threads); they do not
+prove the compute stream blocked or provide its blocking duration. CUDA stream
+handles and Kineto stream IDs are not assumed interchangeable. Wait attribution
+and root cause remain `unknown`/`unresolved` when the trace cannot establish them.
+Use a focused Nsight Systems CUDA-event/dependency capture on the target if those
+ambiguities persist, instead of interpreting CPU API duration as GPU wait time.
+
+If reproducible cross-partition variation disappears under serialization, that
+supports an execution-context effect, not a choice of estimator by itself. If it
+persists, compare the retained Mamba backward kernel names/durations, allocation
+calls and launch gaps. Autograd-internal state/recomputation, clocks and allocator
+cache behavior can still matter; overlapping activity alone proves no causal
+resource contention. No estimator change is made by this diagnostic.
+
+### Local Overlap Validation (2026-10-01)
+
+The four-GPU Nemotron-H 4B run was **not available**: this machine exposes two
+6 GiB RTX A2000s. None of partition5/s2/[13,19), partition4/s4/[26,32),
+partition1/s6/[39,45), or partition2/s1/[6,13) has been remeasured here.
+Their target wall/event/serialized times, overlap, waits and causal diagnosis
+remain unavailable. The following is a separate tiny hybrid harness check.
+
+Retained, ignored artifacts:
+`slackpipe_experiments/overlap_diagnostic_20261001/{normal-v2,serialized-v2}`
+and `comparison.json` (`slackpipe.overlap_diagnostic.v1`). Both runs completed
+PP=2/N=4/L=12/B=8, FP32, sequence length 32, SGD, six partitions, 20 full-step
+warmups and 30 measurements. Each has 11,520 measured F/B samples, 12 raw trace
+files, and every captured global iteration 0..49. The comparison validated
+52 input hashes and produced 48 partition/stage/phase comparisons, with zero
+samples discarded. No solver cost profile was produced.
+
+Collection provenance: base commit `8d528c69b18ef8e3179b01ddd6d22b190df2a704`,
+tracked-diff SHA256
+`0841a62d393a852827545846043633d425967d7cda9528acf9f9cfbefc7181ad`.
+Per-rank metadata retains untracked-source hashes, hardware, software, native
+allocator settings and timing configuration. The paired collection used one
+frozen source tree; subsequent offline-analysis/tests/docs and the optional
+NVTX extension are not represented as the source of those measurements.
+
+Same stage 1, worker 1, range [3,6), backward. Values are medians of 30 raw
+iteration means over all eight microbatches, in milliseconds:
+
+| Partition | Normal host wall | Normal event | Serialized wall | Serialized event | Normal GPU activity union | Serialized GPU activity union |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 0 | 7.1492 | 7.1474 | 7.1886 | 7.1560 | 0.5310 | 0.5304 |
+| 1 | 6.9910 | 6.9892 | 7.0787 | 7.0467 | 0.5300 | 0.5299 |
+| 3 | 16.0924 | 16.0897 | 16.1569 | 16.1152 | 0.5307 | 0.5306 |
+
+Normal wall is asynchronous host time, not a completion-latency measurement.
+Across all measured operations in both modes, no NCCL/co-resident-stage activity
+overlapped the correlated GPU envelopes; no earlier-P2P overlaps or in-operation
+stream-wait API candidates were observed. Native batch P2P synchronization was
+already enabled, with `overlap_p2p_comm=false`. This does not certify absence of
+unobserved waits or external-process contention.
+
+For the rows above, normal envelope internal gaps were 6.4101, 6.2345 and
+15.1917 ms; serialized gaps were 6.4212, 6.2964 and 15.2178 ms. Each group had
+36 distinct associated activity names and the same median per-iteration activity count; no
+in-operation CUDA allocation API calls were attributed. Thus this local variation
+persisted under serialization and appeared predominantly in gaps, not the union
+of GPU activity. CPU dispatch/launch behavior deserves further investigation;
+the precise cause, Mamba state/recomputation contribution and relevance to the
+large target remain unresolved. No claim of intrinsic compute timing follows.
+
+Validation in `slackpipe-dev`: 196 regression tests passed (including quality,
+filtering and retry policies); the final expanded focused suite passed 11 tests.
+Homogeneous and hybrid PP=2 FP32 numerical equivalence each passed on both ranks.
+An independent scalar/matrix CUDA test preserved gradients and SGD updates
+exactly with normal/serialized instrumentation. A separate single-GPU Nsight
+smoke (`nvtx-smoke.nsys-rep`) captured the expected F/B labels and native event
+handles; it was not a warmed performance measurement or target dependency study.
 
 Probe records contain `compute_gpu_ms`, `cpu_wall_ms`, stream ID and operation
 positions. `existing_stage_wall_ms` and per-operation `wait_synchronization_ms`

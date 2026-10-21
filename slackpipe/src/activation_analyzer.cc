@@ -16,7 +16,7 @@
 #include "slackpipe/evaluation_method.h"
 #include "slackpipe/operation.h"
 #include "slackpipe/result_validator.h"
-#include "slackpipe/slackpipe_solver.h"
+#include "slackpipe/instance.h"
 
 #ifndef SLACKPIPE_HAVE_ORTOOLS
 #define SLACKPIPE_HAVE_ORTOOLS 0
@@ -966,10 +966,9 @@ ActivationUniformBaseline DeriveUniformActivationBaseline(
       baseline.warnings.push_back(warning);
     for (const std::string &error : analyzed.errors)
       baseline.errors.push_back(error);
-    if (const EvaluationMethodDefinition *definition =
-            FindEvaluationMethod(kUniformBreadthFirstMethod)) {
-      baseline.method_contract_hash = EvaluationMethodContractHash(*definition);
-    }
+    baseline.method_contract_hash = StableHashHex(
+        std::string("internal_activation_baseline.v1|") + kUniformPartitionRule +
+        "|" + kFixedScheduleRuleBreadthFirst);
     const std::string seed = BaselineDerivationSeed(
         instance, options, baseline.partition, baseline.method_contract_hash);
     baseline.cap_derivation_hash = StableHashHex(seed);

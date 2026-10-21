@@ -9,12 +9,12 @@ from collections import defaultdict
 from pathlib import Path
 
 from megatron.core.pipeline_parallel.slackpipe.isolated_profile import ESTIMATOR
-from megatron.core.pipeline_parallel.slackpipe.profile_quality import require_profile_quality
+from megatron.core.pipeline_parallel.slackpipe.profile_integrity import validate_profile_integrity
 from tools.slackpipe_compare_compute_timing import load_run
 
 
 def compare(profile: dict, pipeline: dict) -> list[dict]:
-    require_profile_quality(profile)
+    validate_profile_integrity(profile)
     if (
         profile.get("estimator") != ESTIMATOR
         or profile["model_manifest_hash"] != pipeline["manifest"]

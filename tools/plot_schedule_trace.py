@@ -154,20 +154,25 @@ def plot_time_bounds(panels: list[dict], detail: bool) -> tuple[float, float]:
 
 
 def render(
-    baseline: dict,
-    slackpipe: dict,
+    panels: list[dict],
     *,
     png: Path,
     pdf: Path,
     title: str,
     caption: str,
     color_mode: str,
-    annotate_saved: bool,
+    annotate_saved: bool = False,
     detail: bool = False,
-    noninterleaved: dict | None = None,
-    octopipe: dict | None = None,
-    refined: dict | None = None,
 ) -> dict:
+    from tools.slackpipe_eval_config import METHODS
+
+    if not panels or len({p["mode"] for p in panels}) != len(panels):
+        raise ValueError("Expected a nonempty set of distinct method panels")
+    if any(p["mode"] not in METHODS for p in panels):
+        raise ValueError(
+            "Historical method labels require the historical plotter; not current methods"
+        )
+    baseline = panels[0]
     import matplotlib
 
     matplotlib.use("Agg")
@@ -195,92 +200,29 @@ def render(
         "model",
         "model_sha256",
     )
-    if any(baseline["config"][key] != slackpipe["config"][key] for key in fields):
-        raise ValueError("Panels do not use matching model/data settings")
-    if baseline["mode"] not in ("baseline", "interleaved") or slackpipe["mode"] != "slackpipe":
-        raise ValueError("Expected baseline on top and SlackPipe on bottom")
-    if baseline["iteration"] != slackpipe["iteration"]:
-        raise ValueError("Panels must show the same global iteration")
-    if bool(baseline["collection"]) != bool(slackpipe["collection"]):
-        raise ValueError("Cannot compare legacy and versioned collection provenance")
-    if baseline["collection"]:
-        a, b = baseline["collection"], slackpipe["collection"]
-        if a["profiler"] != b["profiler"]:
-            raise ValueError("Panels use different profiler settings")
-        for k in ("allocator_environment", "allocator_backend", "torch", "cuda", "nccl"):
-            if a["environment"][k] != b["environment"][k]:
-                raise ValueError(f"Panels use different {k}")
-    panels = [baseline, slackpipe]
-    titles = ["Interleaved 1F1B", "SlackPipe"]
-    if refined is not None:
-        if refined["mode"] != "slackpipe-refined":
-            raise ValueError("Expected SlackPipe + Refine panel")
-        if any(refined["config"][k] != baseline["config"][k] for k in fields if k != "num_stages"):
-            raise ValueError("Refined model/data settings differ")
-        base_n, pp = baseline["config"]["num_stages"], baseline["config"]["pp"]
-        if (
-            refined["config"].get("base_N") != base_n
-            or refined["config"]["num_stages"] != base_n + pp
-            or refined["config"].get("effective_N") != base_n + pp
-        ):
-            raise ValueError("Refined panel must have explicit base N and effective N+W")
-        if refined["iteration"] != baseline["iteration"]:
-            raise ValueError("Refined panel must show the same global iteration")
-        for panel in (refined, slackpipe):
-            for k in ("profiler", "active_iterations", "cycle"):
-                if panel["collection"][k] != baseline["collection"][k]:
-                    raise ValueError(f"Refined capture policy differs: {k}")
-            for k in ("allocator_environment", "allocator_backend", "torch", "cuda", "nccl"):
-                if (
-                    panel["collection"]["environment"][k]
-                    != baseline["collection"]["environment"][k]
-                ):
-                    raise ValueError(f"Refined environment differs: {k}")
-        panels.append(refined)
-        titles.append("SlackPipe + Refine")
-    if octopipe is not None:
-        if octopipe["mode"] != "octopipe":
-            raise ValueError("Expected OctoPipe panel")
-        if any(octopipe["config"][k] != baseline["config"][k] for k in fields):
-            raise ValueError("OctoPipe model/data settings differ")
-        if octopipe["iteration"] != baseline["iteration"]:
-            raise ValueError("OctoPipe must show the same global iteration")
-        if not octopipe["collection"] or not baseline["collection"]:
-            raise ValueError("OctoPipe comparison requires versioned capture provenance")
-        for panel in (octopipe, slackpipe):
-            for k in ("profiler", "active_iterations", "cycle"):
-                if panel["collection"][k] != baseline["collection"][k]:
-                    raise ValueError(f"Four-panel capture policy differs: {k}")
-            for k in ("allocator_environment", "allocator_backend", "torch", "cuda", "nccl"):
-                if (
-                    panel["collection"]["environment"][k]
-                    != baseline["collection"]["environment"][k]
-                ):
-                    raise ValueError(f"Four-panel environment differs: {k}")
-        panels.insert(1, octopipe)
-        titles.insert(1, "OctoPipe (fixed-stage, cyclic)")
-    if noninterleaved is not None:
-        if noninterleaved["mode"] != "1f1b" or noninterleaved["iteration"] != baseline["iteration"]:
-            raise ValueError("Expected native 1F1B at the same global iteration")
-        if any(
-            noninterleaved["config"][k] != baseline["config"][k]
-            for k in fields
-            if k != "num_stages"
-        ):
-            raise ValueError("1F1B model/data settings differ")
-        if noninterleaved["config"]["num_stages"] != noninterleaved["config"]["pp"]:
+    for panel in panels:
+        if any(panel["config"][k] != baseline["config"][k] for k in fields if k != "num_stages"):
+            raise ValueError("Panels use different model/data settings")
+        if panel["iteration"] != baseline["iteration"]:
+            raise ValueError("Panels must show the same global iteration")
+        if panel["mode"] == "1f1b" and panel["config"]["num_stages"] != panel["config"]["pp"]:
             raise ValueError("Native 1F1B must have N=PP")
-        for k in ("profiler", "active_iterations", "cycle"):
-            if noninterleaved["collection"][k] != baseline["collection"][k]:
-                raise ValueError(f"1F1B capture policy differs: {k}")
-        for k in ("allocator_environment", "allocator_backend", "torch", "cuda", "nccl"):
-            if (
-                noninterleaved["collection"]["environment"][k]
-                != baseline["collection"]["environment"][k]
-            ):
-                raise ValueError(f"1F1B environment differs: {k}")
-        panels.insert(0, noninterleaved)
-        titles.insert(0, "Native 1F1B")
+        if bool(panel["collection"]) != bool(baseline["collection"]):
+            raise ValueError("Cannot mix collection provenance versions")
+        if panel["collection"]:
+            for key in ("profiler", "active_iterations", "cycle"):
+                if panel["collection"][key] != baseline["collection"][key]:
+                    raise ValueError(f"Capture policy differs: {key}")
+            for key in ("allocator_environment", "allocator_backend", "torch", "cuda", "nccl"):
+                if (
+                    panel["collection"]["environment"][key]
+                    != baseline["collection"]["environment"][key]
+                ):
+                    raise ValueError(f"Environment differs: {key}")
+    optimized_n = {p["config"]["num_stages"] for p in panels if p["mode"] != "1f1b"}
+    if len(optimized_n) > 1:
+        raise ValueError("Plan/interleaved methods must use the same explicit N")
+    titles = [METHODS[p["mode"]].display_name for p in panels]
     plt.rcParams.update(
         {"font.family": "DejaVu Sans", "font.size": 10, "pdf.fonttype": 42, "ps.fonttype": 42}
     )
@@ -289,7 +231,9 @@ def render(
         1,
         figsize=(11, 2.5 * len(panels) + 0.45 * (baseline["rank_count"] - 2)),
         sharex=True,
+        squeeze=False,
     )
+    axes = axes[:, 0]
     left_bound, right_bound = plot_time_bounds(panels, detail)
     padding = max(0.001, (right_bound - left_bound) * 0.025)
     for panel_index, (axis, panel) in enumerate(zip(axes, panels)):
@@ -357,23 +301,14 @@ def render(
             fontsize=11,
             pad=9,
         )
-    saved = baseline["duration_ms"] - slackpipe["duration_ms"]
-    if annotate_saved and saved > 0:
-        left, right = slackpipe["duration_ms"], baseline["duration_ms"]
-        y = slackpipe["rank_count"] - 0.5
-        axes[-1].annotate(
-            "",
-            xy=(left, y),
-            xytext=(right, y),
-            arrowprops=dict(arrowstyle="<->", color="#b62732", linewidth=1.2),
-        )
+    saved = baseline["duration_ms"] - panels[-1]["duration_ms"]
+    if annotate_saved and len(panels) > 1:
         axes[-1].text(
-            right,
-            y + 0.1,
-            f"{saved:.2f} ms saved",
-            color="#b62732",
+            0.99,
+            1.02,
+            f"Profiled span difference from first panel: {saved:+.2f} ms",
+            transform=axes[-1].transAxes,
             ha="right",
-            va="bottom",
             fontsize=9,
         )
     axes[-1].set_xlabel("Time from panel step start (ms)")
@@ -404,13 +339,9 @@ def render(
         fig.savefig(path, dpi=300, facecolor="white")
     plt.close(fig)
     return dict(
-        schema_version="slackpipe.figure_report.v1",
-        baseline=baseline,
-        noninterleaved=noninterleaved,
-        octopipe=octopipe,
-        refined=refined,
-        slackpipe=slackpipe,
-        time_saved_ms=saved,
+        schema_version="slackpipe.figure_report.v2",
+        panels=panels,
+        profiled_span_difference_ms=saved,
         plot_time_bounds_ms=[left_bound, right_bound],
         png=str(png),
         pdf=str(pdf),
@@ -422,62 +353,49 @@ def render(
 
 
 def main():
+    from tools.slackpipe_eval_config import METHODS
+
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--baseline", type=Path, required=True)
-    parser.add_argument("--slackpipe", type=Path, required=True)
-    parser.add_argument("--noninterleaved", type=Path, help="Optional native 1F1B third panel")
-    parser.add_argument("--octopipe", type=Path, help="Optional fixed-stage OctoPipe panel")
-    parser.add_argument("--refined", type=Path, help="Optional SlackPipe + Stage Refinement panel")
+    parser.add_argument(
+        "--panel", action="append", required=True, help="METHOD=trace-directory; repeat per method"
+    )
     parser.add_argument("--output-png", type=Path, required=True)
     parser.add_argument("--output-pdf", type=Path, required=True)
     parser.add_argument("--report", type=Path, required=True)
     parser.add_argument("--iteration", type=int)
-    parser.add_argument("--baseline-run-id")
-    parser.add_argument("--slackpipe-run-id")
-    parser.add_argument("--cycle", type=int)
+    parser.add_argument("--cycle", type=int, default=0)
     parser.add_argument("--detail", action="store_true")
-    parser.add_argument("--title", default="Heterogeneous LARGE: PP=2, 4 logical stages")
+    parser.add_argument("--title", default="Pipeline schedule traces")
     parser.add_argument(
         "--caption",
-        default="GPU logical-work envelopes from torch.profiler; white gaps are outside labeled work, not guaranteed hardware idle.",
+        default="Profiled GPU envelopes; gaps are not guaranteed hardware idle. Not benchmark evidence.",
     )
     parser.add_argument("--color-mode", choices=("direction", "microbatch"), default="microbatch")
-    parser.add_argument("--annotate-time-saved", action="store_true")
     args = parser.parse_args()
+    directories = dict(item.split("=", 1) for item in args.panel)
+    if set(directories) - METHODS.keys() or len(directories) != len(args.panel):
+        parser.error("Unknown or duplicate method")
     candidates = sorted(
-        available_iterations(args.baseline, args.baseline_run_id, args.cycle)
-        & available_iterations(args.slackpipe, args.slackpipe_run_id, args.cycle)
-    )
-    if args.noninterleaved:
-        candidates = sorted(
-            set(candidates) & available_iterations(args.noninterleaved, cycle=args.cycle)
+        set.intersection(
+            *(available_iterations(Path(path), cycle=args.cycle) for path in directories.values())
         )
-    if args.octopipe:
-        candidates = sorted(set(candidates) & available_iterations(args.octopipe, cycle=args.cycle))
-    if args.refined:
-        candidates = sorted(set(candidates) & available_iterations(args.refined, cycle=args.cycle))
+    )
     if not candidates:
         parser.error("No common complete-rank global iteration")
     iteration = args.iteration if args.iteration is not None else candidates[0]
+    if iteration not in candidates:
+        parser.error("Requested iteration is not present on all ranks/captures")
+    panels = [load_panel(Path(path), iteration, cycle=args.cycle) for path in directories.values()]
+    if any(panel["mode"] != method for panel, method in zip(panels, directories)):
+        parser.error("Panel method provenance does not match its label")
     report = render(
-        load_panel(args.baseline, iteration, args.baseline_run_id, args.cycle),
-        load_panel(args.slackpipe, iteration, args.slackpipe_run_id, args.cycle),
+        panels,
         png=args.output_png,
         pdf=args.output_pdf,
         title=args.title,
         caption=args.caption,
         color_mode=args.color_mode,
-        annotate_saved=args.annotate_time_saved,
         detail=args.detail,
-        noninterleaved=(
-            load_panel(args.noninterleaved, iteration, cycle=args.cycle)
-            if args.noninterleaved
-            else None
-        ),
-        octopipe=(
-            load_panel(args.octopipe, iteration, cycle=args.cycle) if args.octopipe else None
-        ),
-        refined=load_panel(args.refined, iteration, cycle=args.cycle) if args.refined else None,
     )
     report["selection"] = dict(
         iteration=iteration,
@@ -485,21 +403,11 @@ def main():
         rule=(
             "explicit"
             if args.iteration is not None
-            else "earliest common complete-rank iteration; no timestamp averaging"
+            else "earliest common complete-rank global iteration"
         ),
     )
     args.report.parent.mkdir(parents=True, exist_ok=True)
     args.report.write_text(json.dumps(report, indent=2) + "\n")
-    print(
-        json.dumps(
-            {
-                "baseline_ms": report["baseline"]["duration_ms"],
-                "slackpipe_ms": report["slackpipe"]["duration_ms"],
-                "time_saved_ms": report["time_saved_ms"],
-            },
-            indent=2,
-        )
-    )
 
 
 if __name__ == "__main__":

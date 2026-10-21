@@ -216,13 +216,15 @@ OctoPipeResult TuneOctoPipeAlgorithm1(const Instance& instance,
       (options.time_limit_seconds == 0 && options.max_iterations == 0)) {
     throw Error("OctoPipe requires a positive time or iteration limit and candidate bound");
   }
+  // The public wall-clock budget includes initialization and its validation.
+  // Iteration-bounded trajectories are unchanged.
+  const auto started = Clock::now();
   auto initial = EvaluateOctoPipeCandidate(instance, initial_split, initial_orders);
   if (!initial) throw Error("invalid OctoPipe initial state");
   OctoPipeResult result;
   result.best = std::move(*initial);
   result.initial_makespan = result.best.schedule.makespan;
   const Tick t_layer = MinimumOctoPipeLayerComputeCost(instance);
-  const auto started = Clock::now();
   auto elapsed = [&]() { return std::chrono::duration<double>(Clock::now() - started).count(); };
   auto expired = [&]() {
     return options.time_limit_seconds > 0 && elapsed() >= options.time_limit_seconds;

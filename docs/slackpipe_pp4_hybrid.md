@@ -1,3 +1,5 @@
+> Historical scope: this document records pre-five-method code/results. Commands and method IDs below are not current entry points. Use the [current workflow](slackpipe_five_methods.md); historical results keep their recorded commit and labels.
+
 # PP4 and Hybrid Readiness
 
 ## Nemotron-H 8B Preparation

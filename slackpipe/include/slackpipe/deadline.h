@@ -68,8 +68,4 @@ class DeadlinePhaseTimer {
   bool expired_before_start_ = false;
 };
 
-inline constexpr double kSlackPipePreparationBudgetFraction = 0.10;
-inline constexpr double kScheduleOnlyPartitionBudgetFraction = 0.50;
-inline constexpr int kEvaluationBudgetPolicyVersion = 1;
-
 }  // namespace slackpipe

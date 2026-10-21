@@ -182,7 +182,6 @@ def test_manifest_and_provenance(tmp_path):
 
 
 def test_calibration_partitions_are_identifiable():
-    from tools.slackpipe_heterogeneous_experiment import select_partitions
 
     cuts, diagnostics = select_partitions(build_model_manifest(make_config()))
     assert len(cuts) >= 6
@@ -257,6 +256,8 @@ def test_heterogeneous_pp1_exact_construction(tmp_path):
 
 @pytest.mark.parametrize("pp", [1, 2])
 def test_heterogeneous_numerical_equivalence(tmp_path, pp):
+    # Single-node fixture: TP=DP=CP=1, one process/device per physical PP rank.
+    Utils.require_cuda_devices(pp)
     if int(os.environ.get("WORLD_SIZE", "1")) != pp:
         pytest.skip(f"requires {pp} ranks")
     torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", "0")))
@@ -358,3 +359,47 @@ def test_heterogeneous_numerical_equivalence(tmp_path, pp):
         clear_slackpipe_runtime_cache()
         Utils.destroy_model_parallel()
         parallel_state.set_virtual_pipeline_model_parallel_world_size(None)
+
+
+def select_partitions(manifest, minimum=6):
+    """Add partitions until all class and role coefficients are identifiable."""
+    import itertools
+
+    import numpy as np
+
+    from megatron.core.pipeline_parallel.slackpipe.cost_profile import stage_role
+
+    classes = [r["config_class"] for r in manifest["layers"]]
+    keys = sorted(set(classes))
+
+    def design(cuts):
+        return np.array(
+            [
+                [classes[a:b].count(k) for k in keys]
+                + [int(stage_role(s, 4) == r) for r in ("first", "middle", "last")]
+                for s, (a, b) in enumerate(zip(cuts, cuts[1:]))
+            ],
+            dtype=float,
+        )
+
+    selected = [(0, 2, 5, 9, 12)]
+    candidates = [(0, *inner, 12) for inner in itertools.combinations(range(1, 12), 3)]
+    columns = len(keys) + 3
+    while True:
+        matrix = np.concatenate([design(c) for c in selected])
+        rank = np.linalg.matrix_rank(matrix)
+        if len(selected) >= minimum and rank == columns:
+            return selected, {
+                "rank": int(rank),
+                "columns": columns,
+                "condition": float(np.linalg.cond(matrix)),
+            }
+        remaining = [c for c in candidates if c not in selected]
+        if not remaining:
+            raise ValueError("no identifiable calibration design")
+
+        def score(c):
+            augmented = np.concatenate([matrix, design(c)])
+            return (-np.linalg.matrix_rank(augmented), np.linalg.cond(augmented), c)
+
+        selected.append(min(remaining, key=score))

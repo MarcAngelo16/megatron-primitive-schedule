@@ -7,7 +7,7 @@
 #include "slackpipe/cost_profile.h"
 #include "slackpipe/io.h"
 #include "slackpipe/joint_solver.h"
-#include "slackpipe/slackpipe_solver.h"
+#include "slackpipe/instance.h"
 #include "slackpipe/workload_bound.h"
 
 namespace {
@@ -111,42 +111,15 @@ TEST(WorkloadBound, OverflowIsExplicitlyUnavailable) {
   EXPECT_FALSE(bound.reason.empty());
 }
 
-TEST(WorkloadBound, ReportingPreservesRawBoundStatusAndLegacyGap) {
+TEST(WorkloadBound, RawBoundAndEffectiveGapRemainDistinct) {
   const auto i = Range();
-  JointOptimizationResult result;
-  result.status = "FEASIBLE"; result.joint_status = "UNKNOWN";
-  result.fallback_used = true; result.makespan_ticks = 54; result.best_bound_ticks = 10;
-  const auto report = ComputeLowerBoundReport(i, result.best_bound_ticks, result.makespan_ticks);
+  const auto report = ComputeLowerBoundReport(i, 10, 54);
   EXPECT_EQ(*report.raw_solver_bound_ticks, 10);
   EXPECT_EQ(*report.workload.makespan_ticks, 37);
   EXPECT_EQ(*report.effective_lower_bound_ticks, 37);
   EXPECT_TRUE(std::abs(*report.effective_relative_gap - 17.0 / 54) < 1e-12);
-  const auto raw = OutcomeFromJointResult(result);
-  EXPECT_TRUE(std::abs(*raw.relative_optimality_gap - 44.0 / 54) < 1e-12);
-  const auto json = ToJson(i, result);
-  EXPECT_TRUE(json.find("\"effective_lower_bound_ticks\":37") != std::string::npos);
-  EXPECT_EQ(result.status, "FEASIBLE");
-  EXPECT_EQ(result.joint_status, "UNKNOWN");
-  EXPECT_FALSE(result.proven_optimal);
-  auto canonical = BuildCanonicalResultMetadata(i, {}, {}, raw, std::nullopt, std::nullopt);
-  canonical.outcome.feasible = false;  // Later result validation may reject it.
-  EXPECT_TRUE(CanonicalResultToJson(canonical, "").find("\"effective_relative_optimality_gap\":null") !=
-              std::string::npos);
-  result.canonical = canonical;
-  EXPECT_TRUE(ToJson(i, result).find("\n  \"lower_bound_report\":") != std::string::npos);
-  EXPECT_TRUE(ToJson(i, result).find("\n  \"lower_bound_report\": " +
-      LowerBoundReportJson(ComputeLowerBoundReport(i, raw.best_objective_bound,
-                                                  std::nullopt, false))) != std::string::npos);
-  // A deadline fallback before Solve() has no raw solver bound, not zero.
-  canonical.lower_bound_report.raw_solver_bound_ticks = std::nullopt;
-  result.canonical = canonical;
-  EXPECT_TRUE(ToJson(i, result).find("\n  \"lower_bound_report\": {\"raw_solver_bound_ticks\":null") !=
-              std::string::npos);
-  EXPECT_EQ(*ComputeLowerBoundReport(i, 0, 54).effective_lower_bound_ticks, 37);
   EXPECT_FALSE(ComputeLowerBoundReport(i, 10, std::nullopt).effective_relative_gap.has_value());
-  const auto inconsistent = ComputeLowerBoundReport(i, 100, 54);
-  EXPECT_TRUE(inconsistent.inconsistent_with_incumbent);
-  EXPECT_FALSE(inconsistent.effective_relative_gap.has_value());
+  EXPECT_FALSE(ComputeLowerBoundReport(i, 100, 54).effective_relative_gap.has_value());
 }
 
 TEST(WorkloadBound, JointOptimaUnchangedAndProfileCapacityConstraintsPresent) {
@@ -155,7 +128,6 @@ TEST(WorkloadBound, JointOptimaUnchangedAndProfileCapacityConstraintsPresent) {
   for (const auto& i : {Tiny(), Affine(), Range()}) {
     JointOptimizerOptions options;
     options.time_limit_seconds = 10;
-    options.worker_balance_pruning = false;
     const auto result = OptimizeJointSplitAndScheduleCpSat(i, options);
     ASSERT_TRUE(result.proven_optimal);
     EXPECT_EQ(result.makespan_ticks, (std::vector<Tick>{18, 42, 54})[index++]);
@@ -163,22 +135,13 @@ TEST(WorkloadBound, JointOptimaUnchangedAndProfileCapacityConstraintsPresent) {
     const auto bound = ComputeWorkloadLowerBound(i);
     ASSERT_TRUE(bound.makespan_ticks.has_value());
     EXPECT_TRUE(*bound.makespan_ticks <= result.makespan_ticks);
-    EXPECT_TRUE(AnalyticalGlobalLowerBound(i) <= result.makespan_ticks);
   }
 }
 
-TEST(WorkloadBound, ConditionalPhaseBoundsDoNotCertifyJointOptimality) {
-  const auto instance = Range();
-  CanonicalOutcome outcome;
-  outcome.feasible = true;
-  outcome.makespan = 63;
-  outcome.best_objective_bound = 63;
-  const auto metadata = BuildCanonicalResultMetadata(
-      instance, {}, SemanticsForAlternatingPartitionSchedule(2), outcome,
-      std::nullopt, std::nullopt);
-  EXPECT_EQ(*metadata.lower_bound_report.raw_solver_bound_ticks, 63);
-  EXPECT_FALSE(metadata.lower_bound_report.raw_bound_globally_valid);
-  EXPECT_EQ(*metadata.lower_bound_report.effective_lower_bound_ticks, 37);
-  EXPECT_TRUE(*metadata.lower_bound_report.effective_relative_gap > 0.4);
+TEST(WorkloadBound, ConditionalBoundDoesNotCertifyJointOptimality) {
+  const auto report = ComputeLowerBoundReport(Range(), 63, 63, false);
+  EXPECT_EQ(*report.raw_solver_bound_ticks, 63);
+  EXPECT_FALSE(report.raw_bound_globally_valid);
+  EXPECT_EQ(*report.effective_lower_bound_ticks, 37);
 }
 }  // namespace

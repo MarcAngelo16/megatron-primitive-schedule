@@ -4,7 +4,6 @@
 import copy
 import json
 import subprocess
-from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -13,34 +12,36 @@ from megatron.core.pipeline_parallel.slackpipe.cost_profile import (
     aggregate_stage_costs,
     build_heterogeneous_cost_profile,
 )
-from megatron.core.pipeline_parallel.slackpipe.profile_quality import (
-    ProfilingQualityError,
-    QualityThresholds,
-    assess_profile,
-    group_consensus,
-    isolate_timing_spikes,
+from megatron.core.pipeline_parallel.slackpipe.profile_integrity import (
     publish_profile,
-    require_profile_quality,
     tag_calibration_events,
+    validate_profile_integrity,
 )
-from tools.slackpipe_profile_quality import collect_with_retry
+from megatron.core.pipeline_parallel.slackpipe.stage_residual import ResidualPolicy
 
 
-def group_profile(root, values, *, raw_spike=False, noisy_group=None, thresholds=None):
-    thresholds = thresholds or QualityThresholds()
+def group_profile(
+    root, values, *, raw_spike=False, noisy_group=None, policy=None, four_stages=False
+):
+    partitions = (
+        ((0, 1, 3, 5, 8), (0, 2, 4, 6, 8), (0, 3, 5, 7, 8))
+        if four_stages
+        else ((0, 1, 3, 6), (0, 2, 4, 6), (0, 3, 5, 6))
+    )
     manifest = dict(
         manifest_hash="one-class-fixture",
-        layers=[dict(layer_id=i, config_class="A") for i in range(6)],
+        layers=[dict(layer_id=i, config_class="A") for i in range(partitions[0][-1])],
     )
     rows = []
     for g, value in enumerate(values):
-        for p, cuts in enumerate(((0, 1, 3, 6), (0, 2, 4, 6), (0, 3, 5, 6))):
+        for p, cuts in enumerate(partitions):
             events = []
-            for s in range(3):
+            for s in range(len(cuts) - 1):
                 local = []
                 for phase in ("forward", "backward"):
                     v = (cuts[s + 1] - cuts[s]) * (1 if phase == "forward" else 2)
-                    v += ([0.5, 0.25, 0.75] if phase == "forward" else [17, 1, 2])[s]
+                    role = 0 if s == 0 else (2 if s == len(cuts) - 2 else 1)
+                    v += ([0.5, 0.25, 0.75] if phase == "forward" else [17, 1, 2])[role]
                     if phase == "backward" and s == p == 0:
                         v = value
                     for i in range(30):
@@ -76,7 +77,6 @@ def group_profile(root, values, *, raw_spike=False, noisy_group=None, thresholds
                     num_microbatches=8,
                     iteration_start=0,
                     iteration_end=29,
-                    quality_thresholds=thresholds,
                 )
             )
     original = copy.deepcopy(rows)
@@ -85,192 +85,142 @@ def group_profile(root, values, *, raw_spike=False, noisy_group=None, thresholds
         observed_stage_rows=rows,
         model_config={},
         parallel_config={},
-        quality_thresholds=thresholds,
+        residual_policy=policy or ResidualPolicy(),
     )
     assert rows == original
     return profile
 
 
 @pytest.mark.parametrize(
-    "values,rejected",
+    "values",
     [
-        ([19, 19.2, 18.9, 19.1, 13.5], 1),
-        ([19, 19.2, 18.9, 13.5, 13.8], 2),
-        ([19, 19.1, 18.9, 19], 0),
-        ([19.05, 18.8, 20.04, 13.75], 1),
-        ([19, 19.2, 18.9, 19.1, 26], 1),
+        [19, 19.2, 18.9, 19.1, 13.5],
+        [19, 19.2, 18.9, 13.5, 13.8],
+        [19, 19.1, 18.9, 19],
+        [19.05, 18.8, 20.04, 13.75],
+        [19, 19.2, 18.9, 19.1, 26],
+        [14, 16, 18, 20, 22],
+        [14, 14.2, 20, 20.1],
+        [19.053, 18.799, 20.045, 13.755, 15.995],
     ],
 )
-def test_clear_consensus_uses_cleaned_fit(tmp_path, values, rejected):
+def test_all_groups_participate_without_consensus_gate(tmp_path, values):
     profile = group_profile(tmp_path, values)
-    report = publish_profile(tmp_path / "cost_profile.json", profile)
-    assert report["status"] == "passed"
-    assert report["rejected_group_count"] == rejected
-    assert all(r["phase"] == "backward" for r in report["rejected_groups"])
-    comparison = next(
-        c
-        for c in report["group_filter"]["comparisons"]
-        if c["phase"] == "backward" and c["stage_layer_range"] == [0, 1]
-    )
-    assert comparison["accepted_group_count"] >= 3
-    assert comparison["cleaned_median_shift"] < 0.1
-    assert comparison["cleaned_cv"] < 0.03
-    assert comparison["consensus_median_ms"] == pytest.approx(19, abs=0.06)
-    inputs = profile["group_filter"]["fit_observations"]["backward"]
-    assert len(inputs) == 9
-    assert inputs[0]["backward_ms_per_op"] == comparison["consensus_median_ms"]
-    if rejected:
-        assert comparison["raw_median_shift"] > 0.3
-        assert comparison["raw_cv"] > comparison["cleaned_cv"]
-        assert len(inputs[0]["source_row_indices"]) == len(values) - rejected
-    # Prefix/role coefficients consumed by C++ are actually refitted, not only approved.
-    assert profile["prefix_backward_us"][1] + profile["stage_role_bias_us"]["first"][
-        "backward"
-    ] == pytest.approx(19000, abs=70)
-    require_profile_quality(profile)
+    validate_profile_integrity(profile)
+    assert "group_filter" not in profile and "quality" not in profile
+    rows = profile["observed_stages"]
+    assert len(rows) == len(values) * 9
+    assert {r["calibration_group_id"] for r in rows} == {
+        f"g{g}-p{p}" for g in range(len(values)) for p in range(3)
+    }
+    report = profile["residual_filter"]["phases"]["backward"]
+    assert len(report["initial_model"]["predicted"]) == len(rows)
+    assert len(report["final_model"]["predicted"]) == len(rows)
+    assert all(r["backward_diagnostics"]["accepted_sample_count"] > 0 for r in rows)
+    path = publish_profile(tmp_path / "cost_profile.json", profile)
+    validate_profile_integrity(json.loads(path.read_text()))
 
 
-@pytest.mark.parametrize("values", [[14, 16, 18, 20, 22], [14, 14.2, 20, 20.1]])
-def test_broad_or_ambiguous_groups_fail_without_trimming(tmp_path, values):
-    report = assess_profile(group_profile(tmp_path, values))
-    assert report["status"] == "rerun_required"
-    assert report["rejected_group_count"] == 0
-    assert any(i["rule"] == "cross_group_median_shift" for i in report["issues"])
+def test_raw_spike_filtering_does_not_require_surviving_cv(tmp_path):
+    profile = group_profile(tmp_path, [19, 19.2, 18.9, 19.1, 13.5], raw_spike=True, noisy_group=0)
+    phase = profile["residual_filter"]["phases"]["forward"]
+    assert phase["applied_excluded_count"] == 1
+    rejected = next(s for s in phase["samples"] if s["applied_excluded"])
+    assert rejected["observed_ms"] == 310
+    assert rejected["calibration_group_id"] == "g0-p0"
+    assert profile["observed_stages"][0]["backward_diagnostics"]["accepted_sample_count"] == 240
+    publish_profile(tmp_path / "cost_profile.json", profile)
 
 
-def test_two_level_filtering_and_surviving_cv_gate(tmp_path):
-    profile = group_profile(tmp_path, [19, 19.2, 18.9, 19.1, 13.5], raw_spike=True)
-    report = assess_profile(profile)
-    assert report["status"] == "passed"
-    assert report["samples_discarded"] == 1 and report["rejected_group_count"] == 1
-    assert report["rejected_samples"][0]["elapsed_ms"] == 310
-    assert report["rejected_groups"][0]["estimate_ms"] == 13.5
-    assert report["effective_accepted_sample_count"] == report["accepted_sample_count"] - 240
-    # CV alone is never a reason to exclude a consensus member.
-    profile = group_profile(tmp_path, [19, 19.2, 18.9, 19.1, 13.5], noisy_group=0)
-    report = assess_profile(profile)
-    assert report["status"] == "rerun_required"
-    assert any(i["rule"] == "within_group_cv" for i in report["issues"])
-
-
-@pytest.mark.parametrize("median,spike", [(5.9342, 20.7578), (5.4485, 20.9894)])
-def test_reported_raw_spikes_remain_recorded(median, spike):
-    events = [
-        dict(
-            logical_stage=0,
-            phase="forward_compute",
-            iteration=i // 8,
-            microbatch=i % 8,
-            elapsed_ms=median,
-        )
-        for i in range(240)
-    ]
-    events[13]["elapsed_ms"] = spike
-    accepted, diagnostics = isolate_timing_spikes(events, QualityThresholds())
-    assert len(accepted) == 239 and diagnostics["samples_discarded"] == 1
-    assert diagnostics["rejected_samples"][0]["elapsed_ms"] == spike
-    assert events[13]["elapsed_ms"] == spike
+def test_required_raw_observation_empty_rolls_back_whole_phase(tmp_path):
+    profile = group_profile(tmp_path, [19, 19, 19, 19, 1000], raw_spike=True)
+    forward = profile["residual_filter"]["phases"]["forward"]
+    backward = profile["residual_filter"]["phases"]["backward"]
+    assert forward["applied_excluded_count"] == 1
+    assert backward["candidate_excluded_count"] > 0
+    assert backward["applied_excluded_count"] == 0
+    assert backward["reason"] == "required_observation_has_no_samples"
+    assert backward["initial_model"] == backward["final_model"]
+    for before, after in zip(profile["raw_observed_stages"], profile["observed_stages"]):
+        assert before["backward_diagnostics"] == after["backward_diagnostics"]
+        assert before["backward_ms_per_op"] == after["backward_ms_per_op"]
+    validate_profile_integrity(profile)
 
 
 @pytest.mark.parametrize(
     "key,value",
     [
-        ("stage", 7),
-        ("stage_layer_range", [1, 2]),
-        ("stage_role", "middle"),
-        ("worker", 3),
-        ("measurement_context", "other"),
         ("layer_composition", ["Mamba"]),
         ("model_manifest_hash", "other-model"),
+        ("class_counts", {"A": 99}),
     ],
 )
-def test_exact_comparability(tmp_path, key, value):
-    profile = group_profile(tmp_path, [19, 19.2, 18.9, 19.1, 13.5])
-    rows = profile["observed_stages"]
-    rows[36][key] = value
-    selected = group_consensus(rows, QualityThresholds())
-    assert not selected["rejected_groups"]
-
-
-@pytest.mark.parametrize(
-    "policy", [dict(group_min_survivors=4), dict(group_max_discarded_fraction=0.2)]
-)
-def test_minimum_survivors_and_discard_limit(tmp_path, policy):
-    t = replace(QualityThresholds(), **policy)
-    profile = group_profile(tmp_path, [19, 19.2, 18.9, 13.5, 13.8], thresholds=t)
-    report = assess_profile(profile, t)
-    assert report["status"] == "rerun_required"
-    assert report["rejected_group_count"] == 0
-    assert any(i["rule"] == "group_consensus" for i in report["issues"])
-
-
-def test_revalidation_cannot_change_policy_or_selection(tmp_path):
-    profile = group_profile(tmp_path, [19, 19.2, 18.9, 19.1, 13.5])
-    report = assess_profile(profile, replace(QualityThresholds(), group_mad_multiplier=4))
-    assert any(i["rule"] == "group_consensus_provenance" for i in report["issues"])
-    publish_profile(tmp_path / "profile.json", profile)
-    profile["group_filter"]["accepted_row_indices"]["backward"].append(36)
-    with pytest.raises(ProfilingQualityError):
-        require_profile_quality(profile)
-
-
-def test_cannot_omit_group_selection_or_launder_manifest(tmp_path):
-    profile = group_profile(tmp_path, [19, 19.2, 18.9, 19.1, 13.5])
-    del profile["group_filter"]
-    assert any(i["rule"] == "missing_group_analysis" for i in assess_profile(profile)["issues"])
+def test_cannot_launder_manifest_or_composition(tmp_path, key, value):
+    profile = group_profile(tmp_path, [19, 19.2, 18.9])
+    rows = copy.deepcopy(profile["raw_observed_stages"])
+    rows[0][key] = value
     with pytest.raises(ValueError, match="composition"):
         build_heterogeneous_cost_profile(
             model_manifest=dict(
-                manifest_hash="different",
-                layers=[dict(layer_id=i, config_class="Mamba") for i in range(6)],
+                manifest_hash="one-class-fixture",
+                layers=[dict(layer_id=i, config_class="A") for i in range(6)],
             ),
-            observed_stage_rows=profile["observed_stages"],
+            observed_stage_rows=rows,
             model_config={},
             parallel_config={},
         )
 
 
-def test_reported_five_estimates_do_not_force_consensus(tmp_path):
-    profile = group_profile(tmp_path, [19.053, 18.799, 20.045, 13.755, 15.995])
-    report = assess_profile(profile)
-    assert report["status"] == "rerun_required"
-    assert not report["rejected_groups"]
-    assert any(i["rule"] == "cross_group_median_shift" for i in report["issues"])
+def test_revalidation_rejects_changed_costs_not_fit_error(tmp_path):
+    profile = group_profile(tmp_path, [14, 16, 18, 20, 22])
+    path = publish_profile(tmp_path / "profile.json", profile)
+    saved = json.loads(path.read_text())
+    saved["prefix_backward_us"][1] += 10
+    with pytest.raises(ValueError, match="hash"):
+        validate_profile_integrity(saved)
+    del saved["cost_profile_hash"]
+    with pytest.raises(ValueError, match="Prefix"):
+        validate_profile_integrity(saved)
 
 
-@pytest.mark.parametrize("stable", [True, False])
-def test_group_quality_retry_and_solver_export(tmp_path, stable):
-    calls = []
+def test_summary_only_history_is_not_relabelled_as_filtered(tmp_path):
+    profile = group_profile(tmp_path, [19, 19.2, 18.9])
+    rows = copy.deepcopy(profile["raw_observed_stages"])
+    for row in rows:
+        for phase in ("forward", "backward"):
+            del row[f"{phase}_diagnostics"]["raw_events"]
+    rebuilt = build_heterogeneous_cost_profile(
+        model_manifest=dict(
+            manifest_hash="one-class-fixture",
+            layers=[dict(layer_id=i, config_class="A") for i in range(6)],
+        ),
+        observed_stage_rows=rows,
+        model_config={},
+        parallel_config={},
+    )
+    assert all(
+        p["status"] == "filter_not_applied"
+        and p["reason"] == "raw_operation_samples_unavailable"
+        and p["mask_passes"] == 0
+        for p in rebuilt["residual_filter"]["phases"].values()
+    )
 
-    def collect(worker, attempt):
-        calls.append(attempt)
-        profile = group_profile(
-            worker, [19, 19.2, 18.9, 19.1, 13.5] if stable else [14, 16, 18, 20, 22]
-        )
-        publish_profile(worker / "cost_profile.json", profile, attempt=attempt)
 
-    if not stable:
-        with (
-            pytest.warns(RuntimeWarning),
-            pytest.raises(ProfilingQualityError, match="retry exhausted"),
-        ):
-            collect_with_retry(tmp_path, collect, {})
-        assert calls == [0, 1]
-        assert (
-            json.loads((tmp_path / "profiling_attempts.json").read_text())["selected_profile"]
-            is None
-        )
-        return
-    selected = collect_with_retry(tmp_path, collect, {})
-    assert calls == [0]
+@pytest.mark.parametrize("values", [[19, 19.2, 18.9, 19.1, 13.5], [14, 16, 18, 20, 22]])
+def test_group_profile_solver_export_without_stability_approval(tmp_path, values):
     binary = Path(__file__).resolve().parents[3] / "slackpipe/build/no-or/slackpipe_cli"
     if not binary.exists():
         pytest.skip("requires no-OR C++ build")
+    selected = publish_profile(tmp_path / "cost_profile.json", group_profile(tmp_path, values))
     result = subprocess.run(
         [
             str(binary),
             "--algorithm",
-            "uniform-breadth-first",
+            "octopipe-tuning",
+            "--time-limit",
+            "1",
+            "--octopipe-max-iterations",
+            "1",
             "--B",
             "4",
             "--N",
@@ -288,6 +238,7 @@ def test_group_quality_retry_and_solver_export(tmp_path, stable):
         ],
         capture_output=True,
         text=True,
+        timeout=30,
     )
     assert result.returncode == 0, result.stdout + result.stderr
     assert (tmp_path / "plan.json").exists()

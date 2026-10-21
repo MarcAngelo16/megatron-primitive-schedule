@@ -53,5 +53,10 @@ struct Instance {
 };
 
 void ValidateSplit(const Instance& instance, const std::vector<Tick>& split);
+[[nodiscard]] std::vector<Tick> UniformSplit(const Instance& instance);
+[[nodiscard]] std::vector<Tick> WorkerLayerTotals(
+    const Instance& instance, const std::vector<Tick>& split);
+[[nodiscard]] std::uint64_t CountValidSplitsCapped(
+    const Instance& instance, std::uint64_t cap);
 
 }  // namespace slackpipe

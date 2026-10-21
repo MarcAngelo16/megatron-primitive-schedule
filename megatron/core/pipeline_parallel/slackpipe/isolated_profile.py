@@ -4,31 +4,13 @@
 import hashlib
 import math
 import statistics
-from dataclasses import asdict, dataclass
 
 from .cost_profile import profile_fingerprint
 from .manifest import canonical_json, manifest_fingerprint
 
 ESTIMATOR = "isolated-layer-compute-v1"
 LEGACY_ESTIMATOR = "existing-stage-wall-time-v1"
-QUALITY_SCHEMA = "slackpipe.isolated_profile_quality.v1"
-
-
-@dataclass(frozen=True)
-class IsolatedPolicy:
-    min_samples: int = 10
-    max_cv: float = 0.15
-    catastrophic_ratio: float = 10.0
-    max_excluded: int = 1
-    min_samples_for_exclusion: int = 30
-
-    def __post_init__(self):
-        if self.min_samples < 2 or not 0 < self.max_cv < 1 or self.catastrophic_ratio <= 1:
-            raise ValueError("Invalid isolated quality thresholds")
-        if self.max_excluded not in (0, 1) or self.min_samples_for_exclusion < 30:
-            raise ValueError(
-                "Isolated exclusion allows at most one catastrophic sample out of >=30"
-            )
+POLICY_VERSION = "layer-median-v1"
 
 
 def class_mapping(manifest: dict, execution: dict) -> list[dict]:
@@ -58,39 +40,21 @@ def class_mapping(manifest: dict, execution: dict) -> list[dict]:
     return list(classes.values())
 
 
-def summarize(values: list[float], policy: IsolatedPolicy) -> dict:
-    """Keep all samples; optionally exclude one >10x-median catastrophe for selection/CV."""
-    if not values or any(not math.isfinite(v) or v <= 0 for v in values):
+def summarize(values: list[float]) -> dict:
+    """Median of every legal measured sample; no exclusion or stability gate."""
+    if not values or any(
+        isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) or v <= 0
+        for v in values
+    ):
         raise ValueError("Isolated timings must be positive finite samples")
-    median = statistics.median(values)
-    candidates = [i for i, v in enumerate(values) if v > policy.catastrophic_ratio * median]
-    excluded = (
-        candidates
-        if len(values) >= policy.min_samples_for_exclusion
-        and len(candidates) <= policy.max_excluded
-        else []
-    )
-    accepted = [v for i, v in enumerate(values) if i not in excluded]
-
-    def stats(v):
-        mean = statistics.fmean(v)
-        return dict(
-            mean_ms=mean,
-            median_ms=statistics.median(v),
-            stddev_ms=statistics.pstdev(v),
-            cv=statistics.pstdev(v) / mean,
-            min_ms=min(v),
-            max_ms=max(v),
-            count=len(v),
-        )
-
-    raw, clean = stats(values), stats(accepted)
     return dict(
-        raw=raw,
-        accepted=clean,
-        excluded_indices=excluded,
-        selected_ms=clean["median_ms"],
-        passed=len(accepted) >= policy.min_samples and clean["cv"] <= policy.max_cv,
+        mean_ms=statistics.fmean(values),
+        median_ms=statistics.median(values),
+        stddev_ms=statistics.pstdev(values),
+        min_ms=min(values),
+        max_ms=max(values),
+        count=len(values),
+        selected_ms=statistics.median(values),
     )
 
 
@@ -102,7 +66,6 @@ def build_profile(
     context: dict,
     model_config: dict,
     parallel_config: dict,
-    policy: IsolatedPolicy,
 ) -> dict:
     """Expand measured medians to ordered layers and the existing [i,j) v2 prefixes."""
     measured = {u["class_signature"]: u for u in units}
@@ -112,9 +75,7 @@ def build_profile(
     }:
         raise ValueError("Missing/duplicate/unexpected profiling units")
     summaries = {
-        key: {
-            phase: summarize(unit[phase + "_gpu_ms"], policy) for phase in ("forward", "backward")
-        }
+        key: {phase: summarize(unit[phase + "_gpu_ms"]) for phase in ("forward", "backward")}
         for key, unit in measured.items()
     }
     layers = [None] * manifest["num_layers"]
@@ -139,32 +100,23 @@ def build_profile(
         for layer in layers:
             values.append(values[-1] + layer[phase + "_us"])
         prefixes["prefix_" + phase + "_us"] = values
-    issues = [
-        dict(
-            class_signature=k,
-            phase=p,
-            cv=v["accepted"]["cv"],
-            threshold=policy.max_cv,
-            samples=v["accepted"]["count"],
-            min_samples=policy.min_samples,
-        )
-        for k, s in summaries.items()
-        for p, v in s.items()
-        if not v["passed"]
-    ]
     profile = dict(
         schema_version="slackpipe.cost_profile.v2",
         estimator=ESTIMATOR,
+        profiling_backend="layer",
+        profiling_policy=dict(policy_version=POLICY_VERSION),
         units="microseconds",
         model_manifest_hash=manifest["manifest_hash"],
         model_config=model_config,
         parallel_config=parallel_config,
+        target_parallel_config=parallel_config,
+        measurement_parallel_config=dict(pp=1, vpp=None, tp=1, dp=1, cp=1),
         measurement_definition=dict(
             measurement_mode="isolated",
             includes_pipeline_wait=False,
             includes_p2p=False,
             includes_communication=False,
-            statistic="median of accepted GPU event samples",
+            statistic="median of all legal GPU event samples; no exclusions",
             timing="synchronized current-stream events; isolated implementation time including launch gaps, not pure FLOP time",
             backward="real autograd with representative upstream gradient; parameter/input grads reset before each F/B pair",
             optimizer_included=False,
@@ -187,12 +139,6 @@ def build_profile(
             }
             for r in ("first", "middle", "last")
         },
-        quality=dict(
-            quality_schema_version=QUALITY_SCHEMA,
-            status="rerun_required" if issues else "passed",
-            thresholds=asdict(policy),
-            issues=issues,
-        ),
         **prefixes,
     )
     # Nested manifest must not expose a second schema_version to the C++ reader.
@@ -206,19 +152,31 @@ def build_profile(
     return profile
 
 
-def require_quality(profile: dict, *, allow_unstable: bool = False) -> None:
-    """Recompute selection and expansion, rather than trusting a 'passed' flag."""
-    from .profile_quality import MESSAGE, ProfilingQualityError
-
+def validate_layer_profile(profile: dict) -> None:
+    """Rebuild the current all-sample median profile, checking data identity only."""
     if profile.get("cost_profile_hash") != profile_fingerprint(profile):
-        raise ProfilingQualityError("Isolated profile hash mismatch")
+        raise ValueError("Layer profile hash mismatch")
     try:
         data = profile["isolated"]
-        if data["context"]["policy"] != profile["quality"]["thresholds"]:
-            raise ValueError("Isolated quality policy changed after collection")
+        current_policy = profile.get("profiling_policy", {}).get("policy_version")
+        if current_policy is not None and (
+            current_policy != POLICY_VERSION
+            or data["context"].get("policy_version") != POLICY_VERSION
+        ):
+            raise ValueError("Layer profiling strategy identity mismatch")
         for unit in data["units"]:
             samples = unit["samples"]
             context = data["context"]
+            if (
+                any(
+                    type(context[k]) is not int or context[k] < 0 for k in ("warmups", "iterations")
+                )
+                or context["iterations"] == 0
+                or any(type(s["iteration"]) is not int for s in samples)
+            ):
+                raise ValueError(
+                    "Isolated sampling requires integer bounds/indices and nonempty samples"
+                )
             if [s["iteration"] for s in samples] != list(
                 range(context["warmups"], context["warmups"] + context["iterations"])
             ):
@@ -230,6 +188,56 @@ def require_quality(profile: dict, *, allow_unstable: bool = False) -> None:
         expected_classes = class_mapping(manifest, data["context"]["execution"])
         if data["classes"] != expected_classes:
             raise ValueError("Class mapping differs from execution/manifest")
+        if current_policy is None:
+            # Audit a historical artifact's recorded selection, never run the old filter.
+            # Its policy and bytes stay historical, even when the old quality flag failed.
+            selected = {}
+            for unit in data["units"]:
+                key = unit["class_signature"]
+                if key in selected:
+                    raise ValueError("Duplicate isolated unit")
+                selected[key] = {}
+                for phase in ("forward", "backward"):
+                    values = unit[phase + "_gpu_ms"]
+                    summarize(values)
+                    summary = data["summaries"][key][phase]
+                    excluded = summary["excluded_indices"]
+                    if len(set(excluded)) != len(excluded) or any(
+                        type(i) is not int or not 0 <= i < len(values) for i in excluded
+                    ):
+                        raise ValueError("Invalid historical selection indices")
+                    retained = [v for i, v in enumerate(values) if i not in excluded]
+                    if not retained or statistics.median(retained) != summary["selected_ms"]:
+                        raise ValueError("Historical layer median differs from recorded selection")
+                    selected[key][phase] = 1000 * summary["selected_ms"]
+            if set(selected) != {c["class_signature"] for c in expected_classes} | {
+                "first",
+                "last",
+            }:
+                raise ValueError("Missing/unexpected historical layer units")
+            if profile["model_manifest_hash"] != manifest["manifest_hash"]:
+                raise ValueError("Historical layer manifest mismatch")
+            for cls in expected_classes:
+                key = cls["class_signature"]
+                if profile["class_costs_us"][key] != selected[key]:
+                    raise ValueError("Historical class expansion mismatch")
+                for i in cls["member_layers"]:
+                    layer = profile["layer_costs_us"][i]
+                    if layer["class_signature"] != key or any(
+                        layer[p + "_us"] != selected[key][p] for p in ("forward", "backward")
+                    ):
+                        raise ValueError("Historical layer expansion mismatch")
+            single = (
+                profile["parallel_config"]["pp"] * (profile["parallel_config"].get("vpp") or 1) == 1
+            )
+            for role in ("first", "middle", "last"):
+                for phase in ("forward", "backward"):
+                    expected = 0 if role == "middle" else selected[role][phase]
+                    if single and role == "first":
+                        expected += selected["last"][phase]
+                    if profile["stage_role_bias_us"][role][phase] != expected:
+                        raise ValueError("Historical boundary expansion mismatch")
+            return
         rebuilt = build_profile(
             manifest=manifest,
             classes=expected_classes,
@@ -237,7 +245,6 @@ def require_quality(profile: dict, *, allow_unstable: bool = False) -> None:
             context=data["context"],
             model_config=profile["model_config"],
             parallel_config=profile["parallel_config"],
-            policy=IsolatedPolicy(**profile["quality"]["thresholds"]),
         )
         if rebuilt["isolated"]["summaries"] != data["summaries"]:
             raise ValueError("Isolated summaries differ from raw samples")
@@ -248,107 +255,17 @@ def require_quality(profile: dict, *, allow_unstable: bool = False) -> None:
             "prefix_forward_us",
             "prefix_backward_us",
             "stage_role_bias_us",
-            "quality",
+            "profiling_policy",
         ):
             if rebuilt[key] != profile[key]:
                 raise ValueError(f"Invalid isolated {key}")
-        if not allow_unstable and rebuilt["quality"]["status"] != "passed":
-            raise ValueError("Unstable isolated measurements")
     except (KeyError, TypeError, ValueError) as e:
-        raise ProfilingQualityError(f"{MESSAGE} {e}") from e
-
-
-def quality_report(profile: dict, *, raw_data_path: str = "") -> dict:
-    """Explain isolated acceptance from validated raw samples, including failed candidates.
-
-    This is an additive sidecar report; existing profile hashes and quality policy
-    remain unchanged. No stage/partition/group evaluator participates.
-    """
-    require_quality(profile, allow_unstable=True)
-    data = profile["isolated"]
-    policy = IsolatedPolicy(**profile["quality"]["thresholds"])
-    classes = {c["class_signature"]: c for c in data["classes"]}
-    units = []
-    for unit in data["units"]:
-        key = unit["class_signature"]
-        info = classes.get(key, {})
-        result = dict(
-            class_signature=key,
-            layer_type=info.get("layer_type", unit.get("layer_type", key)),
-            member_layer_indices=info.get("member_layers", []),
-            representative_layer=info.get("representative_layer"),
-            signature=info.get("signature"),
-            executed=unit.get("executed"),
-        )
-        for phase in ("forward", "backward"):
-            s = data["summaries"][key][phase]
-            raw = unit[phase + "_gpu_ms"]
-            excluded = s["excluded_indices"]
-            fraction = len(excluded) / len(raw)
-            max_fraction = policy.max_excluded / policy.min_samples_for_exclusion
-            rules = []
-            if s["accepted"]["count"] < policy.min_samples:
-                rules.append("isolated_sample_count")
-            if fraction > max_fraction:
-                rules.append("isolated_rejected_fraction")
-            if s["accepted"]["cv"] > policy.max_cv:
-                rules.append("isolated_cv")
-            result[phase] = dict(
-                **s["accepted"],
-                raw_statistics=s["raw"],
-                raw_samples_ms=raw,
-                accepted_samples_ms=[v for i, v in enumerate(raw) if i not in excluded],
-                raw_sample_count=len(raw),
-                accepted_sample_count=s["accepted"]["count"],
-                samples_discarded=len(excluded),
-                discarded_indices=excluded,
-                rejected_fraction=fraction,
-                max_rejected_fraction=max_fraction,
-                selected_ms=s["selected_ms"],
-                max_cv=policy.max_cv,
-                min_samples=policy.min_samples,
-                failed_rules=rules,
-                status="rerun_required" if rules else "passed",
-            )
-        result["status"] = (
-            "passed"
-            if all(result[p]["status"] == "passed" for p in ("forward", "backward"))
-            else "rerun_required"
-        )
-        units.append(result)
-    return dict(
-        profile["quality"],
-        estimator=ESTIMATOR,
-        sampling={k: data["context"][k] for k in ("warmups", "iterations")},
-        raw_data_path=raw_data_path,
-        units=units,
-    )
-
-
-def failure_summary(report: dict) -> str:
-    """Human-readable class/phase diagnosis; full raw samples remain in the report."""
-    failures = []
-    for unit in report["units"]:
-        for phase in ("forward", "backward"):
-            s = unit[phase]
-            if s["status"] != "passed":
-                failures.append(
-                    f"class={unit['layer_type']}:{unit['class_signature']} phase={phase} "
-                    f"rules={','.join(s['failed_rules'])} CV={s['cv']:.6g} limit={s['max_cv']} "
-                    f"accepted={s['accepted_sample_count']}/{s['raw_sample_count']} "
-                    f"discarded={s['samples_discarded']} mean_ms={s['mean_ms']:.6g} "
-                    f"median_ms={s['median_ms']:.6g} raw={report['raw_data_path']}"
-                )
-    return "; ".join(failures)
+        raise ValueError(f"Invalid layer profile: {e}") from e
 
 
 def add_arguments(parser) -> None:
-    parser.add_argument(
-        "--calibration-estimator", choices=(ESTIMATOR, LEGACY_ESTIMATOR), default=ESTIMATOR
-    )
     parser.add_argument("--isolated-profile-warmups", type=int, default=20)
     parser.add_argument("--isolated-profile-iterations", type=int, default=30)
-    parser.add_argument("--isolated-profile-max-cv", type=float, default=0.15)
 
 
 def execution_signature(

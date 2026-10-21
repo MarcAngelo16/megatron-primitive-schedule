@@ -39,18 +39,13 @@ add_library(slackpipe_warnings INTERFACE)
 target_compile_options(slackpipe_warnings INTERFACE -Wall -Wextra -Wpedantic -Werror)
 
 add_library(slackpipe_core
-  src/benchmark.cc
   src/activation_cpsat.cc
   src/activation_analyzer.cc
-  src/alternating_solver.cc
-  src/bfs_solver.cc
   src/breadth_first.cc
   src/cost_profile.cc
   src/dag_evaluator.cc
   src/deadline.cc
   src/evaluation_method.cc
-  src/fixed_order_partition_solver.cc
-  src/hybrid_slack.cc
   src/instance.cc
   src/interleaving_stats.cc
   src/io.cc
@@ -60,11 +55,9 @@ add_library(slackpipe_core
   src/octopipe_tuner.cc
   src/workload_bound.cc
   src/plan_export.cc
-  src/pressure_pruning.cc
-  src/heuristic_hint.cc
+  src/slack_heuristic.cc
   src/result_schema.cc
   src/result_validator.cc
-  src/slackpipe_solver.cc
 )
 target_include_directories(slackpipe_core PUBLIC include)
 target_link_libraries(slackpipe_core PUBLIC slackpipe_warnings)
@@ -148,9 +141,7 @@ if(SLACKPIPE_ORTOOLS_FOUND)
   else()
     set(SLACKPIPE_VARIABLE_CUMULATIVE_DEMAND_SUPPORTED 0)
   endif()
-  target_sources(slackpipe_core PRIVATE src/bfs_solver_cpsat.cc)
   target_sources(slackpipe_core PRIVATE src/joint_solver_cpsat.cc)
-  target_sources(slackpipe_core PRIVATE src/slackpipe_solver_cpsat.cc)
   target_compile_definitions(slackpipe_core PUBLIC SLACKPIPE_HAVE_ORTOOLS=1)
   target_link_libraries(slackpipe_core PUBLIC ortools::ortools)
 else()
@@ -180,23 +171,24 @@ message(STATUS "SlackPipe OR-Tools support: ${SLACKPIPE_ORTOOLS_STATUS}")
 add_executable(slackpipe_cli apps/slackpipe_cli.cc)
 target_link_libraries(slackpipe_cli PRIVATE slackpipe_core)
 
-add_executable(slackpipe_benchmark apps/slackpipe_benchmark.cc)
-target_link_libraries(slackpipe_benchmark PRIVATE slackpipe_core)
 
 add_executable(octopipe_phase_diagnostic apps/octopipe_phase_diagnostic.cc)
 target_link_libraries(octopipe_phase_diagnostic PRIVATE slackpipe_core)
+
+
 
 if(SLACKPIPE_BUILD_TESTS)
   enable_testing()
   find_package(GTest QUIET)
   find_package(Python3 COMPONENTS Interpreter QUIET)
   add_executable(slackpipe_core_tests
-    tests/benchmark_tests.cc
-    tests/core_tests.cc
+    tests/common_tests.cc
+    tests/joint_tests.cc
     tests/octopipe_tests.cc
     tests/octopipe_diagnostic_tests.cc
     tests/workload_bound_tests.cc
     tests/heuristic_tests.cc
+    tests/profile_solver_tests.cc
   )
   if(GTest_FOUND)
     target_link_libraries(slackpipe_core_tests PRIVATE slackpipe_core GTest::gtest_main)
@@ -212,10 +204,6 @@ if(SLACKPIPE_BUILD_TESTS)
   set_tests_properties(slackpipe_core_ortools_smoke_tests
                        PROPERTIES LABELS ortools)
   if(Python3_Interpreter_FOUND)
-    add_test(
-      NAME focused_eval_runner_tests
-      COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/focused_eval_runner_test.py
-    )
     add_test(
       NAME result_validator_cli_tests
       COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/result_validator_cli_test.py $<TARGET_FILE:slackpipe_cli>

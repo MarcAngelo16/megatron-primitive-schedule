@@ -4,7 +4,7 @@
 #include <memory>
 #include <optional>
 
-#include "slackpipe/heuristic_hint.h"
+#include "slackpipe/slack_heuristic.h"
 
 // Internal primitives are exposed here for direct, non-stochastic regression
 // tests. They are not a second solver or a public plan interchange format.

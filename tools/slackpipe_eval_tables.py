@@ -5,8 +5,8 @@ import csv
 import json
 from pathlib import Path
 
-from tools.slackpipe_eval_config import load_model, parameter_breakdown
-from tools.slackpipe_hybrid import write_json
+from tools.slackpipe_eval_common import write_json
+from tools.slackpipe_eval_config import METHODS, load_model, parameter_breakdown
 
 
 def write_csv(path: Path, rows: list) -> None:
@@ -55,21 +55,11 @@ def latex_model_table(models: list) -> str:
 
 
 def benefits(times: dict) -> dict:
-    pairs = {
-        "slackpipe_vs_1f1b": ("1f1b", "slackpipe"),
-        "interleaving_benefit": ("1f1b", "interleaved"),
-        "slackpipe_vs_interleaved": ("interleaved", "slackpipe"),
-        "octopipe_vs_1f1b": ("1f1b", "octopipe"),
-        "octopipe_vs_interleaved": ("interleaved", "octopipe"),
-        "slackpipe_vs_octopipe": ("octopipe", "slackpipe"),
-        "refinement_benefit": ("slackpipe", "slackpipe-refined"),
-        "partition_contribution": ("interleaved", "optimized_interleaved"),
-        "scheduling_contribution": ("optimized_interleaved", "slackpipe"),
-    }
     return {
-        key: (times[a] - times[b]) / times[a]
-        for key, (a, b) in pairs.items()
-        if a in times and b in times
+        f"{b}_vs_{a}": (times[a] - times[b]) / times[a]
+        for i, a in enumerate(METHODS)
+        for b in tuple(METHODS)[i + 1 :]
+        if a in times and b in times and times[a] > 0
     }
 
 
@@ -107,8 +97,8 @@ def comparison_identity(summary: dict) -> dict:
 
 
 def export_tables(output: Path, config_paths: list) -> None:
-    from tools.run_slackpipe_eval import receipt_valid
-    from tools.slackpipe_experiment_driver import summarize_samples
+    from tools.slackpipe_eval_common import summarize_samples
+    from tools.slackpipe_eval_receipts import receipt_valid
 
     models = [load_model(p) for p in config_paths]
     model_rows = [
@@ -127,6 +117,11 @@ def export_tables(output: Path, config_paths: list) -> None:
         base = dict(
             model=f"{root.parent.name}_{root.name}",
             stage=stage,
+            method_id=receipt.get("method_id"),
+            executor=receipt.get("executor"),
+            transport=receipt.get("transport"),
+            solver_profile=receipt.get("solver_profile"),
+            profile_identity=receipt.get("profile_identity"),
             status=receipt["status"],
             receipt=str(path.relative_to(output)),
         )
@@ -162,10 +157,12 @@ def export_tables(output: Path, config_paths: list) -> None:
             )
         elif stage == "solve":
             plan = json.loads((root / receipt["plan"]).read_text())
+            solver = json.loads((root / receipt["solver_result"]).read_text())
             solvers.append(
                 {
                     **base,
-                    "solver_status": plan.get("solver_status"),
+                    "solver_status": solver.get("solver_status_raw"),
+                    "solver": solver,
                     "predicted_makespan": plan.get("predicted_makespan"),
                     "predicted_makespan_units": plan.get("cost_model", {}).get("units"),
                     "layer_split": plan.get("layer_split"),
@@ -184,10 +181,10 @@ def export_tables(output: Path, config_paths: list) -> None:
                 "Refusing cross-method comparison with different model/data/environment/policy"
             )
         identities[model] = identity
-        combined = summarize_samples([r for s in summaries for r in s["all_samples_by_run"]])
+        walls = [w for s in summaries for w in s["continuous_step_ms_by_run"]]
+        combined = summarize_samples([[w] for w in walls])
         if combined["num_repetitions"] == 1:
             combined["ci95_ms"] = combined["rep_mean_stddev_ms"] = None
-        walls = [w for s in summaries for w in s["continuous_step_ms_by_run"]]
         mean = sum(walls) / len(walls)
         config = summaries[0]["config"]
         if any(s["config"] != config for s in summaries):
@@ -197,6 +194,8 @@ def export_tables(output: Path, config_paths: list) -> None:
             **combined,
             "config": config,
             "continuous_mean_ms": mean,
+            "continuous_ci95_ms": combined["ci95_ms"],
+            "summary_metric": "max-rank continuous window wall time / measured steps",
             "samples_per_second": config["global_batch_size"] * 1000 / mean,
             "tokens_per_second": config["global_batch_size"] * config["seq_length"] * 1000 / mean,
             "peak_allocated_bytes": max(s["peak_allocated_bytes"] for s in summaries),

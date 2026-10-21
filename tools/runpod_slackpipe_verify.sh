@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
-# Run inside nvcr.io/nvidia/pytorch:26.01-py3 with the project's dependencies.
+# Run inside the prepared project container; no host dependency installation.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}"
-exec "${PYTHON:-python}" -m tools.run_slackpipe_nemotron_h8b_pp4 env "$@"
+exec "${PYTHON:-python}" -m tools.run_slackpipe_eval --phase env \
+  --model-config configs/slackpipe_eval/nemotron_h_8b.json \
+  --method slack-heuristic --pp 4 --num-stages 8 "$@"

@@ -4,9 +4,7 @@
 import gc
 import tempfile
 import time
-import warnings
 from contextlib import ExitStack, contextmanager
-from dataclasses import asdict
 from datetime import datetime, timezone
 from unittest.mock import patch
 
@@ -20,31 +18,26 @@ from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEm
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.pipeline_parallel.slackpipe.collection import environment_metadata
-from megatron.core.pipeline_parallel.slackpipe.cost_profile import (
-    profile_fingerprint,
-    write_cost_profile,
-)
+from megatron.core.pipeline_parallel.slackpipe.cost_profile import profile_fingerprint
 from megatron.core.pipeline_parallel.slackpipe.isolated_profile import (
     ESTIMATOR,
-    IsolatedPolicy,
+    POLICY_VERSION,
     build_profile,
     class_mapping,
     execution_signature,
-    failure_summary,
-    quality_report,
 )
 from megatron.core.pipeline_parallel.slackpipe.manifest import build_model_manifest
-from megatron.core.pipeline_parallel.slackpipe.profile_quality import MESSAGE
+from megatron.core.pipeline_parallel.slackpipe.profile_integrity import publish_profile
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.spec_utils import build_module
+from tools.slackpipe_eval_common import write_json
 from tools.slackpipe_eval_config import (
     fingerprint,
     load_model,
     schedule_topology,
     transformer_config,
 )
-from tools.slackpipe_hybrid import write_json
 
 
 @contextmanager
@@ -225,8 +218,8 @@ def collect(args) -> None:
         raise ValueError("Isolated collector must run in a fresh single-process worker")
     if args.output.exists():
         raise FileExistsError("Use a fresh isolated output directory")
-    if args.isolated_profile_warmups < 1 or args.isolated_profile_iterations < 10:
-        raise ValueError("Isolated profiling requires >=1 warmup and >=10 measurements")
+    if args.isolated_profile_warmups < 1 or args.isolated_profile_iterations < 1:
+        raise ValueError("Isolated profiling requires positive warmup and measurement counts")
     model = load_model(args.model_config)
     topology = schedule_topology(args.schedule, args.pp, args.logical_stages, args.microbatches)
     config = transformer_config(model, dict(pp=1, vpp=None), args.precision)
@@ -246,7 +239,10 @@ def collect(args) -> None:
         precision=args.precision,
     )
     classes = class_mapping(manifest, execution)
-    policy = IsolatedPolicy(max_cv=args.isolated_profile_max_cv)
+    from tools.slackpipe_eval_common import require_cuda_devices
+
+    # Target PP is profile metadata; isolated collection uses one GPU/process.
+    require_cuda_devices(1, local_rank=0)
     args.output.mkdir(parents=True)
     started = time.perf_counter()
     torch.cuda.set_device(0)
@@ -262,14 +258,14 @@ def collect(args) -> None:
             environment = environment_metadata()
             context = dict(
                 estimator=ESTIMATOR,
+                profiling_backend="layer",
                 execution=execution,
                 model_config_hash=fingerprint(model),
                 model_manifest_hash=manifest["manifest_hash"],
                 warmups=args.isolated_profile_warmups,
                 iterations=args.isolated_profile_iterations,
                 statistic="median",
-                policy_version="slackpipe.isolated_profile_quality.v1",
-                policy=asdict(policy),
+                policy_version=POLICY_VERSION,
                 class_signatures=[c["class_signature"] for c in classes],
                 environment=environment,
                 seed=args.seed,
@@ -305,7 +301,6 @@ def collect(args) -> None:
                     args.output / "isolated_profile_raw.json",
                     dict(
                         schema_version="slackpipe.isolated_profile_raw.v1",
-                        attempt=args.profiling_attempt,
                         timestamp=datetime.now(timezone.utc).isoformat(),
                         context=context,
                         units=units,
@@ -319,7 +314,6 @@ def collect(args) -> None:
                 classes=classes,
                 units=units,
                 context=context,
-                policy=policy,
                 model_config=dict(
                     **manifest["model_config"],
                     model_config_hash=fingerprint(model),
@@ -340,6 +334,11 @@ def collect(args) -> None:
                 peak_reserved_bytes=max(u["peak_reserved_bytes"] for u in units),
                 environment=environment,
             )
+            profile["target_instance"] = dict(
+                num_microbatches=args.microbatches,
+                num_stages=topology["num_stages"],
+                num_layers=model["num_layers"],
+            )
             profile["cost_profile_hash"] = profile_fingerprint(profile)
             write_json(args.output / "model_manifest.json", manifest)
             write_json(
@@ -350,32 +349,20 @@ def collect(args) -> None:
                     collection=profile["collection"],
                 ),
             )
-            write_cost_profile(args.output / "cost_profile.candidate.json", profile)
-            report = quality_report(
-                profile, raw_data_path=str(args.output / "isolated_profile_raw.json")
-            )
-            write_json(
-                args.output / "cost_profile.quality.json",
-                dict(report, attempt=args.profiling_attempt),
-            )
-            if profile["quality"]["status"] == "passed":
-                write_cost_profile(args.output / "cost_profile.json", profile)
-            else:
-                warnings.warn(f"{MESSAGE} {failure_summary(report)}")
-                raise SystemExit(2)
+            publish_profile(args.output / "cost_profile.json", profile)
         finally:
             parallel_state.destroy_model_parallel()
             dist.destroy_process_group()
 
 
 def main() -> None:
-    from tools.run_slackpipe_eval import argument_parser, normalize_args
+    from tools.slackpipe_eval_args import argument_parser, normalize_args
 
     parser = argument_parser()
     parser.add_argument("--run-id")
     args = normalize_args(parser.parse_args())
-    if args.stage != "calibrate" or args.calibration_estimator != ESTIMATOR:
-        parser.error("This worker only implements isolated calibration")
+    if args.stage != "calibrate":
+        parser.error("This worker only implements --phase calibrate")
     collect(args)
 
 

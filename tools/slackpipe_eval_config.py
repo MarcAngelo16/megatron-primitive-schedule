@@ -8,24 +8,119 @@ Unsupported architecture options are rejected rather than approximately counted.
 
 import hashlib
 import json
+import math
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
 SCHEMA = "slackpipe.eval_model.v1"
-COMPARISON_SCHEDULES = ("1f1b", "interleaved", "octopipe", "slackpipe", "slackpipe-refined")
-SCHEDULES = (*COMPARISON_SCHEDULES, "optimized_interleaved")
-PLAN_SCHEDULES = ("octopipe", "slackpipe", "slackpipe-refined", "optimized_interleaved")
+METHOD_CONTRACT_VERSION = 3
+
+
+@dataclass(frozen=True)
+class Method:
+    method_id: str
+    display_name: str
+    executor: str
+    requires_solve: bool = False
+    requires_ortools: bool = False
+    backend: str | None = None
+    fixed_flags: tuple[str, ...] = ()
+    supports_threads: bool = False
+    supports_activation_cap: bool = False
+    topology: str = "explicit_cyclic"
+    budget_policy: str = "not_applicable"
+
+    def contract(self) -> dict:
+        return dict(version=METHOD_CONTRACT_VERSION, **asdict(self))
+
+
+METHODS = {
+    m.method_id: m
+    for m in (
+        Method("1f1b", "Native 1F1B", "megatron-native", topology="N=PP"),
+        Method(
+            "interleaved-1f1b",
+            "Native interleaved 1F1B",
+            "megatron-native",
+            topology="PP>1,N>PP,B%PP=0",
+        ),
+        Method(
+            "octopipe-tuning",
+            "OctoPipe-Tuning",
+            "slackpipe",
+            True,
+            backend="octopipe-tuning",
+            budget_policy="wall_clock",
+            supports_threads=False,
+        ),
+        Method(
+            "cpsat-no-hint",
+            "CP-SAT without hints",
+            "slackpipe",
+            True,
+            True,
+            "cpsat-no-hint",
+            supports_threads=True,
+            supports_activation_cap=True,
+            budget_policy="wall_clock_no_external_incumbent_or_fallback",
+        ),
+        Method(
+            "slack-heuristic",
+            "Slack-based Heuristic",
+            "slackpipe",
+            True,
+            backend="slack-heuristic",
+            budget_policy="wall_clock_coupled",
+        ),
+    )
+}
+SCHEDULES = COMPARISON_SCHEDULES = tuple(METHODS)
+PLAN_SCHEDULES = tuple(m.method_id for m in METHODS.values() if m.requires_solve)
 
 
 def canonical_schedule(schedule: str) -> str:
-    """Keep existing receipt namespaces while accepting the comparison label."""
-    return "interleaved" if schedule == "1f1b-interleave" else schedule
+    """Retired names must not silently reuse incompatible receipts."""
+    if schedule not in METHODS:
+        raise ValueError(f"Unknown/retired method {schedule!r}; choose {', '.join(METHODS)}")
+    return schedule
 
 
 def execution_mode(schedule: str) -> str:
-    """Both optimizer plans use the same executor, not the native 1F1B order."""
-    if schedule in ("octopipe", "slackpipe", "slackpipe-refined"):
-        return "slackpipe"
-    return "partition" if schedule == "optimized_interleaved" else "baseline"
+    """The plan executor name is not an optimization method."""
+    return "slackpipe" if METHODS[canonical_schedule(schedule)].requires_solve else "baseline"
+
+
+def solver_arguments(
+    method_id: str, seconds: float, workers: int = 1, activation_cap: list[int] | None = None
+) -> list[str]:
+    method = METHODS[canonical_schedule(method_id)]
+    if not method.requires_solve:
+        raise ValueError(f"{method_id} is a native Megatron method")
+    if not math.isfinite(seconds) or seconds <= 0:
+        raise ValueError("Search wall-clock budget must be positive and finite")
+    if workers < 1 or (workers != 1 and not method.supports_threads):
+        raise ValueError(f"{method_id} supports only one solver worker")
+    if activation_cap is not None and not method.supports_activation_cap:
+        raise ValueError(f"{method_id} cannot enforce activation caps")
+    flags = [
+        "--algorithm",
+        method.backend,
+        "--time-limit",
+        str(seconds),
+        "--num-workers",
+        str(workers),
+        *method.fixed_flags,
+    ]
+    if activation_cap is not None:
+        if not activation_cap or any(v < 0 for v in activation_cap):
+            raise ValueError("Invalid activation cap")
+        flags += [
+            "--enforce-activation-cap",
+            "true",
+            "--activation-cap-units",
+            ",".join(map(str, activation_cap)),
+        ]
+    return flags
 
 
 def fingerprint(value: dict) -> str:
@@ -167,18 +262,16 @@ def schedule_topology(schedule: str, pp: int, stages: int | None, microbatches: 
     schedule = canonical_schedule(schedule)
     if schedule not in SCHEDULES or pp not in (1, 2, 4) or microbatches < 1:
         raise ValueError("Unsupported schedule, PP or B")
-    stages = stages if stages is not None else (pp if schedule == "1f1b" else 2 * pp)
+    if stages is None and schedule != "1f1b":
+        raise ValueError("Specify --num-stages explicitly for interleaving/plan methods")
+    stages = pp if stages is None else stages
     if stages < pp or stages % pp:
         raise ValueError("Cyclic placement requires N % PP == 0")
-    refinement = {}
-    if schedule == "slackpipe-refined":
-        refinement = dict(base_N=stages, effective_N=stages + pp)
-        stages += pp
     if schedule == "1f1b" and stages != pp:
         raise ValueError("Native 1F1B requires N=PP and VPP=None")
-    if schedule in ("interleaved", "optimized_interleaved") and (stages == pp or pp == 1):
+    if schedule == "interleaved-1f1b" and (stages == pp or pp == 1):
         raise ValueError("Native interleaving requires physical PP>1 and N>PP")
-    if schedule in ("interleaved", "optimized_interleaved") and microbatches % pp:
+    if schedule == "interleaved-1f1b" and microbatches % pp:
         raise ValueError("Native interleaving requires B divisible by PP")
     return dict(
         pp=pp,
@@ -188,7 +281,6 @@ def schedule_topology(schedule: str, pp: int, stages: int | None, microbatches: 
         tp=1,
         dp=1,
         cp=1,
-        **refinement,
     )
 
 

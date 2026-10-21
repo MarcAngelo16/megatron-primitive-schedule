@@ -274,4 +274,58 @@ void ValidateSplit(const Instance& instance, const std::vector<Tick>& split) {
   }
 }
 
+std::vector<Tick> UniformSplit(const Instance& instance) {
+  instance.Validate();
+  const Tick minimum_total =
+      CheckedMul(instance.stages, instance.min_layers, "uniform split minimum");
+  if (instance.total_layers < minimum_total) {
+    throw Error("uniform split requires L >= N * min_layers");
+  }
+  const Tick remaining = instance.total_layers - minimum_total;
+  const Tick q = remaining / instance.stages;
+  const Tick remainder = remaining % instance.stages;
+  std::vector<Tick> split(static_cast<std::size_t>(instance.stages),
+                          instance.min_layers + q);
+  for (Index s = 0; s < remainder; ++s) {
+    ++split[static_cast<std::size_t>(s)];
+  }
+  ValidateSplit(instance, split);
+  return split;
+}
+
+std::vector<Tick> WorkerLayerTotals(const Instance& instance,
+                                    const std::vector<Tick>& split) {
+  instance.Validate();
+  ValidateSplit(instance, split);
+  std::vector<Tick> totals(static_cast<std::size_t>(instance.workers), 0);
+  for (Index s = 0; s < instance.stages; ++s) {
+    totals[static_cast<std::size_t>(instance.WorkerForStage(s))] +=
+        split[static_cast<std::size_t>(s)];
+  }
+  return totals;
+}
+
+std::uint64_t CountValidSplitsCapped(const Instance &instance,
+                                     std::uint64_t cap) {
+  instance.Validate();
+  if (cap == 0) return 0;
+
+  const Tick slack =
+      instance.total_layers -
+      CheckedMul(instance.stages, instance.min_layers, "split count slack");
+  if (slack < 0) return 0;
+  const std::uint64_t n = static_cast<std::uint64_t>(
+      CheckedAdd(slack, instance.stages - 1, "split count binomial n"));
+  std::uint64_t k = static_cast<std::uint64_t>(instance.stages - 1);
+  if (k > n - k) k = n - k;
+
+  __uint128_t value = 1;
+  for (std::uint64_t i = 1; i <= k; ++i) {
+    value *= (n - k + i);
+    value /= i;
+    if (value >= cap) return cap;
+  }
+  return static_cast<std::uint64_t>(value);
+}
+
 }  // namespace slackpipe

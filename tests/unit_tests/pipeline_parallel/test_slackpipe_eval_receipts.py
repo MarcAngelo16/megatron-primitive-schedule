@@ -5,21 +5,17 @@ import json
 import sys
 from collections import Counter
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from tools import run_slackpipe_real_system_campaign as campaign
 from tools.run_slackpipe_eval import Experiment, argument_parser
-from tools.run_slackpipe_nemotron_h8b_pp4 import digest
+from tools.slackpipe_eval_common import digest, write_json
 from tools.slackpipe_eval_config import COMPARISON_SCHEDULES, fingerprint, parameter_breakdown
-from tools.slackpipe_eval_receipts import (
-    EMPTY_DIFF,
-    LEGACY_COMMIT,
-    RECEIPT_SCHEMA,
-    assess_receipt,
-    legacy_source_compatible,
-)
-from tools.slackpipe_hybrid import write_json
+from tools.slackpipe_eval_receipts import assess_receipt
+
+EMPTY_DIFF = __import__("hashlib").sha256(b"").hexdigest()
 
 CONFIG = Path(__file__).resolve().parents[3] / "configs/slackpipe_eval/llama_8b.json"
 
@@ -27,18 +23,23 @@ CONFIG = Path(__file__).resolve().parents[3] / "configs/slackpipe_eval/llama_8b.
 def args_for(root, stage="solve", **updates):
     args = argument_parser().parse_args(
         [
+            "--phase",
             stage,
+            "--num-stages",
+            "8",
             "--model-config",
             str(CONFIG),
             "--output",
             str(root),
             "--resume",
-            "--calibration-estimator",
-            "existing-stage-wall-time-v1",
+            "--profiling-method",
+            "stage",
         ]
     )
     for key, value in updates.items():
         setattr(args, key, value)
+    if args.schedule == "1f1b" and "logical_stages" not in updates:
+        args.logical_stages = args.pp
     return args
 
 
@@ -88,6 +89,17 @@ def synthetic(monkeypatch):
                     cost_model=dict(path=str(self.output / self.completed["calibrate"]["profile"])),
                 ),
             )
+            write_json(
+                directory / "solver.json",
+                dict(
+                    schema_version=2,
+                    method_id=a.schedule,
+                    final_solution_available=True,
+                    solver_status_raw="FEASIBLE",
+                ),
+            )
+        elif name == "validate":
+            write_json(directory / "independent_validation.json", dict(passed=True))
         else:
             pytest.fail(f"unexpected command: {command}")
 
@@ -97,7 +109,10 @@ def synthetic(monkeypatch):
         directory.mkdir(parents=True)
         a = self.args
         if stage == "calibrate":
-            from megatron.core.pipeline_parallel.slackpipe.profile_quality import publish_profile
+            assert kwargs["schedule"] == (
+                "interleaved-1f1b" if kwargs["backend"] == "stage" else self.args.schedule
+            )
+            from megatron.core.pipeline_parallel.slackpipe.profile_integrity import publish_profile
             from tests.unit_tests.pipeline_parallel.test_slackpipe_profile_quality import (
                 stable_profile,
             )
@@ -113,7 +128,13 @@ def synthetic(monkeypatch):
                 parallel_config={k: self.topology[k] for k in ("pp", "vpp", "tp", "dp", "cp")},
             )
             profile.update(stable_profile())
-            if a.calibration_estimator == "isolated-layer-compute-v1":
+            n = self.topology["num_stages"]
+            cuts = [self.model["num_layers"] * s // n for s in range(n + 1)]
+            profile["calibration_partition"] = [y - x for x, y in zip(cuts, cuts[1:])]
+            profile["bias_fwd"] = profile["bias_bwd"] = [0.0] * n
+            profile["measurement_parallel_config"] = profile["parallel_config"]
+            profile["target_parallel_config"] = profile["parallel_config"]
+            if kwargs.get("backend") == "layer":
                 from megatron.core.pipeline_parallel.slackpipe.isolated_profile import (
                     execution_signature,
                 )
@@ -126,7 +147,6 @@ def synthetic(monkeypatch):
                 isolated = fixture_profile(
                     warmups=a.isolated_profile_warmups,
                     iterations=a.isolated_profile_iterations,
-                    max_cv=a.isolated_profile_max_cv,
                     manifest=build_model_manifest(
                         transformer_config(self.model, self.topology, a.precision)
                     ),
@@ -138,7 +158,9 @@ def synthetic(monkeypatch):
                     ),
                 )
                 isolated.update(
-                    model_config=profile["model_config"], parallel_config=profile["parallel_config"]
+                    model_config=profile["model_config"],
+                    parallel_config=profile["parallel_config"],
+                    target_parallel_config=profile["parallel_config"],
                 )
                 from megatron.core.pipeline_parallel.slackpipe.cost_profile import (
                     profile_fingerprint,
@@ -146,12 +168,38 @@ def synthetic(monkeypatch):
 
                 isolated["cost_profile_hash"] = profile_fingerprint(isolated)
                 write_json(directory / "cost_profile.json", isolated)
-                write_json(directory / "cost_profile.candidate.json", isolated)
-                write_json(directory / "cost_profile.quality.json", isolated["quality"])
                 return
-            publish_profile(
-                directory / "cost_profile.json", profile, attempt=kwargs.get("attempt", 0)
+            from megatron.core.pipeline_parallel.slackpipe.cost_profile import build_cost_profile
+            from megatron.core.pipeline_parallel.slackpipe.stage_residual import (
+                residual_policy_from_args,
             )
+
+            profile = build_cost_profile(
+                events=[
+                    dict(
+                        logical_stage=s,
+                        iteration=i,
+                        microbatch=b,
+                        phase=phase + "_compute",
+                        elapsed_ms=(end - begin) * factor,
+                        calibration_group_id="fixture",
+                    )
+                    for s, (begin, end) in enumerate(zip(cuts, cuts[1:]))
+                    for i in range(
+                        a.calibration_warmups, a.calibration_warmups + a.calibration_iterations
+                    )
+                    for b in range(a.microbatches)
+                    for phase, factor in (("forward", 1), ("backward", 2))
+                ],
+                model_config=profile["model_config"],
+                parallel_config=profile["parallel_config"],
+                layer_split=profile["calibration_partition"],
+                num_microbatches=a.microbatches,
+                iteration_start=a.calibration_warmups,
+                iteration_end=a.calibration_warmups + a.calibration_iterations - 1,
+                residual_policy=residual_policy_from_args(a),
+            )
+            publish_profile(directory / "cost_profile.json", profile)
         else:
             config = dict(
                 self.topology,
@@ -191,7 +239,13 @@ def synthetic(monkeypatch):
     monkeypatch.setattr(Experiment, "_worker", worker)
     import torch
 
-    monkeypatch.setattr(torch.cuda, "device_count", lambda: 0)
+    # Synthetic orchestration represents a capable node, not a zero-GPU bypass.
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 8)
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda i: (10**12, 10**12))
+    monkeypatch.setattr(
+        torch.cuda, "get_device_properties", lambda i: SimpleNamespace(name="fixture", uuid=str(i))
+    )
     monkeypatch.setattr(
         "tools.run_slackpipe_eval.memory_preflight", lambda *a: dict(status="passed")
     )
@@ -225,49 +279,8 @@ def test_exact_standalone_three_campaign_one_reproduction(tmp_path, synthetic):
         ("repetitions", 5, {"benchmark"}),
         ("calibration_iterations", 20, {"calibrate", "solve", "smoke", "benchmark", "trace"}),
         ("calibration_warmups", 8, {"calibrate", "solve", "smoke", "benchmark", "trace"}),
-        (
-            "quality_outlier_mad_multiplier",
-            12,
-            {"calibrate", "solve", "smoke", "benchmark", "trace"},
-        ),
-        (
-            "quality_outlier_median_multiplier",
-            4,
-            {"calibrate", "solve", "smoke", "benchmark", "trace"},
-        ),
-        (
-            "quality_max_outlier_fraction",
-            0.01,
-            {"calibrate", "solve", "smoke", "benchmark", "trace"},
-        ),
-        (
-            "quality_max_outlier_iteration_fraction",
-            0.1,
-            {"calibrate", "solve", "smoke", "benchmark", "trace"},
-        ),
-        (
-            "quality_max_consecutive_outliers",
-            2,
-            {"calibrate", "solve", "smoke", "benchmark", "trace"},
-        ),
-        ("quality_min_outlier_samples", 30, {"calibrate", "solve", "smoke", "benchmark", "trace"}),
-        ("quality_group_mad_multiplier", 4, {"calibrate", "solve", "smoke", "benchmark", "trace"}),
-        (
-            "quality_group_relative_deviation",
-            0.2,
-            {"calibrate", "solve", "smoke", "benchmark", "trace"},
-        ),
-        (
-            "quality_group_max_discarded_fraction",
-            0.3,
-            {"calibrate", "solve", "smoke", "benchmark", "trace"},
-        ),
-        ("quality_group_min_survivors", 4, {"calibrate", "solve", "smoke", "benchmark", "trace"}),
-        (
-            "quality_group_consensus_median_shift",
-            0.05,
-            {"calibrate", "solve", "smoke", "benchmark", "trace"},
-        ),
+        ("stage_residual_k", 12, {"calibrate", "solve", "smoke", "benchmark", "trace"}),
+        ("stage_residual_rho", 0.8, {"calibrate", "solve", "smoke", "benchmark", "trace"}),
         ("solver_seconds", 600, {"solve", "smoke", "benchmark", "trace"}),
         ("profiler_active", 4, {"trace"}),
         ("trace_warmups", 9, {"trace"}),
@@ -286,23 +299,19 @@ def test_stage_invalidation(tmp_path, synthetic, field, value, changed):
 @pytest.mark.parametrize("systemic", [False, True])
 @pytest.mark.parametrize("group_level", [False, True])
 def test_raw_spikes_campaign_continuation(tmp_path, synthetic, monkeypatch, systemic, group_level):
-    from megatron.core.pipeline_parallel.slackpipe.profile_quality import (
-        ProfilingQualityError,
-        publish_profile,
-        thresholds_from_args,
-    )
+    from megatron.core.pipeline_parallel.slackpipe.profile_integrity import publish_profile
+    from megatron.core.pipeline_parallel.slackpipe.stage_residual import residual_policy_from_args
     from tests.unit_tests.pipeline_parallel.test_slackpipe_group_quality import group_profile
     from tests.unit_tests.pipeline_parallel.test_slackpipe_outliers import raw_profile
 
     original = Experiment._worker
-    attempts = []
+    collections = []
 
     def worker(self, stage, directory, **kwargs):
         if stage != "calibrate":
             return original(self, stage, directory, **kwargs)
         directory.mkdir(parents=True)
-        attempt = kwargs["attempt"]
-        attempts.append(attempt)
+        collections.append(kwargs["backend"])
         spikes = [
             (4, "forward", 13, 356),
             (2, "forward", 50, 313),
@@ -311,15 +320,16 @@ def test_raw_spikes_campaign_continuation(tmp_path, synthetic, monkeypatch, syst
         ]
         if systemic:
             spikes.append((4, "forward", 14, 356))
-        thresholds = thresholds_from_args(self.args)
+        policy = residual_policy_from_args(self.args)
         if group_level:
             profile = group_profile(
                 directory,
                 [14, 16, 18, 20, 22] if systemic else [19, 19.2, 18.9, 19.1, 13.5],
-                thresholds=thresholds,
+                policy=policy,
+                four_stages=True,
             )
         else:
-            profile, events = raw_profile(directory, spikes, thresholds=thresholds)
+            profile, events = raw_profile(directory, spikes, policy=policy)
             write_json(directory / "raw.json", events)
         profile["model_config"] = dict(
             model_config_hash=fingerprint(self.model),
@@ -328,6 +338,8 @@ def test_raw_spikes_campaign_continuation(tmp_path, synthetic, monkeypatch, syst
             micro_batch_size=self.args.micro_batch_size,
         )
         profile["parallel_config"] = {k: self.topology[k] for k in ("pp", "vpp", "tp", "dp", "cp")}
+        profile["measurement_parallel_config"] = profile["parallel_config"]
+        profile["target_parallel_config"] = profile["parallel_config"]
         if profile["schema_version"] == "slackpipe.cost_profile.v2":
             from megatron.core.pipeline_parallel.slackpipe.manifest import build_model_manifest
             from tools.slackpipe_eval_config import transformer_config
@@ -335,38 +347,51 @@ def test_raw_spikes_campaign_continuation(tmp_path, synthetic, monkeypatch, syst
             profile["model_manifest_hash"] = build_model_manifest(
                 transformer_config(self.model, self.topology, self.args.precision)
             )["manifest_hash"]
-        publish_profile(
-            directory / "cost_profile.json", profile, thresholds=thresholds, attempt=attempt
-        )
+            for key in ("raw_observed_stages", "observed_stages"):
+                for row in profile[key]:
+                    row["model_manifest_hash"] = profile["model_manifest_hash"]
+        profile["quality"] = {"status": "failed"}  # Historical metadata is not an admission rule.
+        publish_profile(directory / "cost_profile.json", profile)
 
     monkeypatch.setattr(Experiment, "_worker", worker)
-    exp = Experiment(args_for(tmp_path, "benchmark"))
-    if systemic:
-        with pytest.warns(RuntimeWarning, match="Profiling measurements are inconsistent"):
-            with pytest.raises(ProfilingQualityError, match="retry exhausted"):
-                exp.execute()
-        assert attempts == [0, 1]
-        assert synthetic["solve"] == 0 and synthetic["slackpipe.benchmark"] == 0
+    from tests.unit_tests.pipeline_parallel.test_slackpipe_eval import tiny_model
+
+    model = tiny_model("llama")
+    model["num_layers"] = 8
+    config = tmp_path / "fixture-model.json"
+    write_json(config, model)
+    exp = Experiment(
+        args_for(
+            tmp_path,
+            "benchmark",
+            model_config=config,
+            logical_stages=4 if group_level else 8,
+            pp=2 if group_level else 4,
+        )
+    )
+    assert exp.execute()["status"] == "passed"
+    assert collections == ["stage"]
+    assert synthetic["solve"] == 1
+    assert synthetic["slack-heuristic.benchmark"] == exp.args.repetitions
+    profile = json.loads((tmp_path / exp.completed["calibrate"]["profile"]).read_text())
+    assert profile["quality"]["status"] == "failed"
+    if group_level:
+        assert "group_filter" not in profile
     else:
-        assert exp.execute()["status"] == "passed"
-        assert attempts == [0]
-        assert synthetic["solve"] == 1
-        assert synthetic["slackpipe.benchmark"] == exp.args.repetitions
-        profile = json.loads((tmp_path / exp.completed["calibrate"]["profile"]).read_text())
-        if group_level:
-            assert profile["quality"]["rejected_group_count"] == 1
-        else:
-            assert profile["quality"]["samples_discarded"] == 4
+        assert profile["residual_filter"]["phases"]["forward"]["applied_excluded_count"] == (
+            5 if systemic else 4
+        )
 
 
-@pytest.mark.parametrize("schedule", ["1f1b", "interleaved"])
+@pytest.mark.parametrize("schedule", ["1f1b", "interleaved-1f1b"])
 def test_native_benchmark_ignores_calibration_solver_trace(tmp_path, synthetic, schedule):
-    first = execute(tmp_path, "benchmark", schedule=schedule)
+    first = execute(tmp_path, "benchmark", schedule=schedule, profiling_method="both")
     before = synthetic.copy()
     second = execute(
         tmp_path,
         "benchmark",
         schedule=schedule,
+        profiling_method="both",
         calibration_iterations=20,
         calibration_warmups=12,
         solver_seconds=600,
@@ -375,6 +400,36 @@ def test_native_benchmark_ignores_calibration_solver_trace(tmp_path, synthetic, 
     assert directories(first) == directories(second)
     assert before == synthetic
     assert "solve" not in second.completed
+    assert "calibrate" not in second.completed
+    assert synthetic[f"{schedule}.calibrate"] == synthetic["solve"] == 0
+
+
+def test_campaign_preflights_all_methods_before_first_worker(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "campaign",
+            "--families",
+            "llama",
+            "--sizes",
+            "8b",
+            "--methods",
+            "1f1b,slack-heuristic",
+            "--pp",
+            "4",
+            "--num-stages",
+            "4",
+            "--output",
+            str(tmp_path),
+        ],
+    )
+    monkeypatch.setattr(
+        Experiment, "execute", lambda *args: pytest.fail("No method may launch yet")
+    )
+    with pytest.raises(ValueError, match="New stage profiling"):
+        campaign.main()
+    assert not list(tmp_path.iterdir())
 
 
 @pytest.mark.parametrize(
@@ -396,14 +451,74 @@ def test_real_inputs_remain_bound(tmp_path, synthetic, field, value):
 
 
 def test_schedule_namespaces_and_shared_native_calibration(tmp_path, synthetic):
-    inter = execute(tmp_path, "solve", schedule="interleaved")
+    inter = execute(tmp_path, "calibrate", schedule="interleaved-1f1b")
     before = synthetic.copy()
-    slack = execute(tmp_path, "solve", schedule="slackpipe")
-    assert directories(inter) == directories(slack)
-    assert before == synthetic
-    for schedule in ("1f1b", "interleaved", "slackpipe"):
+    slack = execute(tmp_path, "solve", schedule="slack-heuristic")
+    assert all(directories(inter)[stage] == directories(slack)[stage] for stage in inter.completed)
+    assert synthetic["solve"] == before["solve"] + 1
+    for schedule in ("1f1b", "interleaved-1f1b", "slack-heuristic"):
         execute(tmp_path, "benchmark", schedule=schedule, run_index=0)
         assert (tmp_path / f"receipts/{schedule}.benchmark.run000.json").exists()
+
+
+def test_three_plan_methods_share_profile_not_solver_results(tmp_path, synthetic):
+    from tools.slackpipe_eval_config import PLAN_SCHEDULES
+
+    experiments = [execute(tmp_path, "solve", schedule=method) for method in PLAN_SCHEDULES]
+    assert len({e.completed["calibrate"]["profile"] for e in experiments}) == 1
+    assert len({e.completed["solve"]["plan"] for e in experiments}) == 3
+    assert synthetic["solve"] == 3
+    for e in experiments:
+        calibration = e.completed["calibrate"]["context"]
+        assert "schedule" not in calibration
+        assert calibration["calibration_schedules"] == {"stage": "interleaved-1f1b"}
+        contract = e.completed["solve"]["context"]["method_contract"]
+        assert contract["method_id"] == e.args.schedule
+        assert e.completed["solve"]["context"]["solver_workers"] == 1
+
+
+def test_no_solution_skips_gpu_and_is_resumable(tmp_path, synthetic, monkeypatch):
+    original = Experiment._execute
+
+    def no_solution(self, command, directory, name):
+        if name == "solve":
+            synthetic["solve"] += 1
+            write_json(
+                directory / "solver.json",
+                dict(
+                    schema_version=2,
+                    method_id="cpsat-no-hint",
+                    final_solution_available=False,
+                    solver_status_raw="UNKNOWN",
+                    best_bound_ticks=7,
+                    makespan_ticks=None,
+                ),
+            )
+        else:
+            original(self, command, directory, name)
+
+    monkeypatch.setattr(Experiment, "_execute", no_solution)
+    exp = Experiment(args_for(tmp_path, "benchmark", schedule="cpsat-no-hint"))
+    assert exp.execute()["status"] == "skipped_prerequisite"
+    receipt = exp.completed["solve"]
+    assert receipt["status"] == "no_valid_solution"
+    assert "plan" not in receipt
+    assert synthetic["cpsat-no-hint.benchmark"] == 0
+    before = synthetic.copy()
+    resumed = Experiment(args_for(tmp_path, "benchmark", schedule="cpsat-no-hint"))
+    assert resumed.execute()["status"] == "skipped_prerequisite"
+    assert synthetic == before
+
+
+def test_old_hinted_receipt_cannot_be_relabelled_as_no_hint(tmp_path, synthetic):
+    exp = execute(tmp_path, "solve", schedule="cpsat-no-hint")
+    receipt = exp.completed["solve"]
+    old = dict(receipt, schema_version="slackpipe.eval_receipt.v2")
+    state, reason, accepted = assess_receipt(old, receipt["context"], tmp_path, {})
+    assert state == "stale" and accepted is None
+    changed = dict(receipt["context"], method_contract=dict(version=2, method_id="joint"))
+    old = dict(receipt, context=changed, context_hash=fingerprint(changed))
+    assert assess_receipt(old, receipt["context"], tmp_path, {})[0] == "stale"
 
 
 def downgrade_to_v1(exp):
@@ -441,78 +556,6 @@ def downgrade_to_v1(exp):
     return old
 
 
-def test_legacy_expensive_artifacts_migrate_without_execution(tmp_path, synthetic):
-    first = execute(tmp_path, "solve")
-    old = downgrade_to_v1(first)
-    before = synthetic.copy()
-    hashes = {p: digest(tmp_path / p) for r in old.values() for p in r["artifacts"]}
-    second = execute(
-        tmp_path, "solve", repetitions=1, warmups=10, iterations=100, profiler_active=4
-    )
-    assert before == synthetic
-    assert directories(first) == directories(second)
-    for stage, receipt in second.completed.items():
-        assert receipt["schema_version"] == RECEIPT_SCHEMA
-        assert receipt["migration"]["original_receipt_hash"] == fingerprint(old[stage])
-    assert hashes == {p: digest(tmp_path / p) for p in hashes}
-    assert len(list((tmp_path / "receipts/history").glob("*.json"))) == len(old)
-    execute(tmp_path, "solve", repetitions=1, warmups=10, iterations=100)
-    assert before == synthetic
-
-
-@pytest.mark.parametrize(
-    "damage", ["artifact", "parent", "source", "warmups", "schema", "failed", "context", "profile"]
-)
-def test_legacy_unsafe_reuse_rejected(tmp_path, synthetic, damage):
-    exp = execute(tmp_path, "solve")
-    old = downgrade_to_v1(exp)
-    receipt = old["calibrate"]
-    if damage == "artifact":
-        (tmp_path / receipt["profile"]).write_text("corrupt")
-    elif damage == "parent":
-        receipt["context"]["parents"]["native-smoke"] = "wrong"
-    elif damage == "source":
-        receipt["context"]["source"]["diff"] = "dirty"
-    elif damage == "warmups":
-        receipt["context"]["policy"]["warmups"] = 20
-    elif damage == "schema":
-        receipt["schema_version"] = "unknown"
-    elif damage == "failed":
-        receipt["status"] = "failed"
-    elif damage == "context":
-        del receipt["context"]["policy"]
-    else:
-        profile_path = tmp_path / receipt["profile"]
-        profile = json.loads(profile_path.read_text())
-        profile["model_config"]["sequence_length"] = 99
-        write_json(profile_path, profile)
-        receipt["artifacts"][receipt["profile"]] = digest(profile_path)
-    write_json(exp.receipt_path("calibrate"), receipt)
-    before = synthetic.copy()
-    with pytest.raises(RuntimeError, match="stale"):
-        execute(tmp_path, "solve", repetitions=1)
-    assert before == synthetic
-
-
-def test_legacy_source_fix_boundary(monkeypatch):
-    # Exercise the audited boundary independently of newer worker changes in this checkout.
-    monkeypatch.setattr(
-        "tools.slackpipe_eval_receipts.subprocess.check_output", lambda *a, **k: b""
-    )
-    monkeypatch.setattr("tools.slackpipe_eval_receipts.subprocess.check_call", lambda *a, **k: 0)
-    assert legacy_source_compatible(dict(commit=LEGACY_COMMIT, diff=EMPTY_DIFF), dict(commit="new"))
-    assert not legacy_source_compatible(
-        dict(commit=LEGACY_COMMIT, diff="dirty"), dict(commit="new")
-    )
-    assert not legacy_source_compatible(dict(commit="unknown", diff=EMPTY_DIFF), dict(commit="new"))
-    monkeypatch.setattr(
-        "tools.slackpipe_eval_receipts.subprocess.check_output", lambda *a, **k: b"worker changed"
-    )
-    assert not legacy_source_compatible(
-        dict(commit=LEGACY_COMMIT, diff=EMPTY_DIFF), dict(commit="new")
-    )
-
-
 def test_octopipe_distinct_solver_shared_calibration(tmp_path, synthetic, monkeypatch):
     commands = []
     original = Experiment._execute
@@ -522,106 +565,61 @@ def test_octopipe_distinct_solver_shared_calibration(tmp_path, synthetic, monkey
         return original(self, command, directory, name)
 
     monkeypatch.setattr(Experiment, "_execute", record)
-    slack = execute(tmp_path, "solve", schedule="slackpipe").completed["solve"]
-    octo = execute(tmp_path, "solve", schedule="octopipe").completed["solve"]
-    assert octo["context"]["solver_algorithm"] == "octopipe-algorithm1-fixed-stage"
+    slack = execute(tmp_path, "solve", schedule="slack-heuristic").completed["solve"]
+    octo = execute(tmp_path, "solve", schedule="octopipe-tuning").completed["solve"]
+    assert octo["context"]["solver_algorithm"] == "octopipe-tuning"
     assert octo["context"]["octopipe_fixed_placement"] is True
     assert slack["plan"] != octo["plan"]
     assert slack["context"]["parents"]["calibrate"] == octo["context"]["parents"]["calibrate"]
-    assert synthetic["octopipe.calibrate"] == 0
-    command = next(c for method, name, c in commands if method == "octopipe" and name == "solve")
-    assert command[command.index("--algorithm") + 1] == "octopipe-algorithm1-fixed-stage"
-    assert command[command.index("--octopipe-fixed-placement") + 1] == "true"
-    assert Experiment(args_for(tmp_path, schedule="octopipe")).dependencies("smoke") == ("solve",)
-    before = synthetic.copy()
-    execute(tmp_path, "solve", schedule="octopipe")
-    assert before == synthetic
-
-
-def test_interleave_alias_keeps_receipt_namespace(tmp_path, synthetic):
-    first = execute(tmp_path, "benchmark", schedule="interleaved")
-    before = synthetic.copy()
-    alias = execute(tmp_path, "benchmark", schedule="1f1b-interleave")
-    assert alias.completed["benchmark"]["directory"] == first.completed["benchmark"]["directory"]
-    assert before == synthetic
-
-
-def test_refined_distinct_receipts_and_effective_n(tmp_path, synthetic, monkeypatch):
-    commands = []
-    original = Experiment._execute
-
-    def record(self, command, directory, name):
-        if name == "solve":
-            commands.append(command)
-        return original(self, command, directory, name)
-
-    monkeypatch.setattr(Experiment, "_execute", record)
-    base = execute(tmp_path, "benchmark")
-    refined = execute(tmp_path, "benchmark", schedule="slackpipe-refined")
-    assert base.topology["num_stages"] == 8
-    assert refined.topology["num_stages"] == 12
-    assert refined.args.logical_stages == 8
-    assert base.completed["calibrate"]["directory"] != refined.completed["calibrate"]["directory"]
-    assert base.completed["solve"]["plan"] != refined.completed["solve"]["plan"]
-    for cmd, n in zip(commands, (8, 12)):
-        assert cmd[cmd.index("--algorithm") + 1] == "joint-unrestricted-no-overlap"
-        assert cmd[cmd.index("--N") + 1] == n
-    for key in ("solver_seconds", "solver_workers", "seed", "ratio", "solver_algorithm"):
-        assert base.completed["solve"]["context"][key] == refined.completed["solve"]["context"][key]
-    from megatron.core.pipeline_parallel.slackpipe.plan import load_slackpipe_plan
-
-    plan = load_slackpipe_plan(
-        tmp_path / refined.completed["solve"]["plan"], pipeline_model_parallel_size=4
+    assert synthetic["octopipe-tuning.calibrate"] == 0
+    command = next(
+        c for method, name, c in commands if method == "octopipe-tuning" and name == "solve"
     )
-    assert plan.num_stages == 12
-    assert sum(plan.layer_split) == refined.model["num_layers"]
-    assert plan.stage_to_worker == tuple(s % 4 for s in range(12))
+    assert command[command.index("--algorithm") + 1] == "octopipe-tuning"
+    assert "--octopipe-fixed-placement" not in command  # fixed by the backend contract
+    assert Experiment(args_for(tmp_path, schedule="octopipe-tuning")).dependencies("smoke") == (
+        "solve",
+    )
     before = synthetic.copy()
-    execute(tmp_path, "benchmark", schedule="slackpipe-refined")
+    execute(tmp_path, "solve", schedule="octopipe-tuning")
     assert before == synthetic
 
 
-@pytest.mark.parametrize("schedule", ["slackpipe", "octopipe", "slackpipe-refined"])
-def test_failed_reprofiling_prevents_campaign_solver(tmp_path, synthetic, monkeypatch, schedule):
-    from megatron.core.pipeline_parallel.slackpipe.profile_quality import (
-        ProfilingQualityError,
-        publish_profile,
-    )
-    from tests.unit_tests.pipeline_parallel.test_slackpipe_profile_quality import shifted_profile
-
+@pytest.mark.parametrize("schedule", ["slack-heuristic", "octopipe-tuning", "cpsat-no-hint"])
+def test_corrupt_selected_profile_prevents_campaign_solver_without_retry(
+    tmp_path, synthetic, monkeypatch, schedule
+):
     original = Experiment._worker
-    attempts = []
+    collections = []
 
     def worker(self, stage, directory, **kwargs):
         if stage != "calibrate":
             return original(self, stage, directory, **kwargs)
-        attempts.append(kwargs["attempt"])
-        publish_profile(
-            directory / "cost_profile.json", shifted_profile(), attempt=kwargs["attempt"]
+        collections.append(kwargs["backend"])
+        directory.mkdir(parents=True)
+        write_json(
+            directory / "cost_profile.json",
+            {"profiling_backend": "stage", "schema_version": "corrupt"},
         )
 
     monkeypatch.setattr(Experiment, "_worker", worker)
     experiment = Experiment(args_for(tmp_path, "solve", schedule=schedule))
-    with (
-        pytest.warns(RuntimeWarning),
-        pytest.raises(ProfilingQualityError, match="retry exhausted"),
-    ):
+    with pytest.raises(RuntimeError, match="Selected stage profiling failed; no fallback"):
         experiment.execute()
-    assert attempts == [0, 1]
+    assert collections == ["stage"]
     assert synthetic["solve"] == 0
     receipt = json.loads(experiment.receipt_path("calibrate").read_text())
-    assert receipt["status"] == "rerun_required"
-    assert any("profiling_attempts.json" in path for path in receipt["artifacts"])
+    assert receipt["status"] == "failed"
+    assert any("collection.json" in path for path in receipt["artifacts"])
 
 
 def test_inspect_is_read_only_and_explains(tmp_path, synthetic):
-    exp = execute(tmp_path, "solve")
-    downgrade_to_v1(exp)
+    execute(tmp_path, "solve")
     original = {p: digest(p) for p in tmp_path.rglob("*") if p.is_file()}
     before = synthetic.copy()
     report = Experiment(args_for(tmp_path, "inspect", repetitions=1)).execute()
     by_stage = {r["stage"]: r for r in report["inspection"]}
-    assert by_stage["solve"]["compatibility"] == "legacy-compatible"
+    assert by_stage["solve"]["compatibility"] == "compatible"
     assert by_stage["benchmark"]["status"] == "missing"
     assert original == {p: digest(p) for p in tmp_path.rglob("*") if p.is_file()}
     assert before == synthetic
@@ -657,6 +655,8 @@ def test_real_campaign_partial_resume_three_repetitions(tmp_path, synthetic, mon
         "argv",
         [
             "campaign",
+            "--num-stages",
+            "8",
             "--families",
             "llama",
             "--sizes",
@@ -666,13 +666,13 @@ def test_real_campaign_partial_resume_three_repetitions(tmp_path, synthetic, mon
             "--repetitions",
             "3",
             "--resume",
-            "--calibration-estimator",
-            "existing-stage-wall-time-v1",
+            "--profiling-method",
+            "stage",
         ],
     )
     campaign.main()
     assert synthetic["solve"] == before["solve"]
-    assert synthetic["slackpipe.calibrate"] == before["slackpipe.calibrate"]
+    assert synthetic["slack-heuristic.calibrate"] == before["slack-heuristic.calibrate"]
     for schedule in COMPARISON_SCHEDULES:
         assert synthetic[(schedule, "benchmark", 0)] == before[(schedule, "benchmark", 0)]
         assert synthetic[(schedule, "benchmark", 1)] == 1
@@ -697,16 +697,13 @@ def test_indexed_repetition_count_does_not_change_identity(tmp_path, synthetic):
 
 
 def test_isolated_receipt_resume_and_policy_invalidation(tmp_path, synthetic):
-    estimator = "isolated-layer-compute-v1"
-    first = execute(tmp_path, "solve", calibration_estimator=estimator)
+    first = execute(tmp_path, "solve", profiling_method="layer")
     before = synthetic.copy()
-    second = execute(tmp_path, "solve", calibration_estimator=estimator)
+    second = execute(tmp_path, "solve", profiling_method="layer")
     assert directories(first) == directories(second) and synthetic == before
-    third = execute(
-        tmp_path, "solve", calibration_estimator=estimator, isolated_profile_iterations=40
-    )
+    third = execute(tmp_path, "solve", profiling_method="layer", isolated_profile_iterations=40)
     assert third.completed["calibrate"]["directory"] != first.completed["calibrate"]["directory"]
-    assert synthetic["slackpipe.calibrate"] == before["slackpipe.calibrate"] + 1
+    assert synthetic["slack-heuristic.calibrate"] == before["slack-heuristic.calibrate"] + 1
 
 
 def test_force_preserves_history_and_full_overrides_resume(tmp_path, synthetic):
@@ -734,72 +731,39 @@ def test_solver_binary_hash_invalidates_only_solve_downstream(tmp_path, syntheti
     } == {"solve", "smoke", "benchmark", "trace"}
 
 
-def test_legacy_across_receipt_only_source_fix(tmp_path, synthetic, monkeypatch):
-    monkeypatch.setattr(
-        "tools.slackpipe_eval_receipts.subprocess.check_output", lambda *a, **k: b""
-    )
-    monkeypatch.setattr("tools.slackpipe_eval_receipts.subprocess.check_call", lambda *a, **k: 0)
-    base = Experiment._base_context
-
-    def identity(self):
-        context = base(self)
-        context["source"] = dict(commit=LEGACY_COMMIT, diff=EMPTY_DIFF)
-        context["environment"]["source"] = dict(
-            commit=LEGACY_COMMIT, diff_sha256=EMPTY_DIFF, untracked_source_sha256={}
-        )
-        return context
-
-    monkeypatch.setattr(Experiment, "_base_context", identity)
-    first = execute(tmp_path, "solve")
-    old = downgrade_to_v1(first)
-
-    def new_identity(self):
-        context = identity(self)
-        context["source"] = dict(commit="receipt-only-fix", diff=EMPTY_DIFF)
-        context["environment"]["source"]["commit"] = "receipt-only-fix"
-        return context
-
-    monkeypatch.setattr(Experiment, "_base_context", new_identity)
-    before = synthetic.copy()
-    migrated = execute(tmp_path, "solve", repetitions=1)
-    assert directories(first) == directories(migrated)
-    assert before == synthetic
-    unknown = dict(old["env"], context=dict(old["env"]["context"], unrecognized_setting=True))
-    state, reason, _ = assess_receipt(unknown, migrated._context("env", {}), tmp_path, {})
-    assert state == "legacy-incompatible" and "unknown/missing legacy context fields" in reason
-
-
 def test_fresh_campaign_shares_only_compatible_upstream_work(tmp_path, synthetic, monkeypatch):
     monkeypatch.setattr(
         sys,
         "argv",
         [
             "campaign",
+            "--num-stages",
+            "8",
             "--families",
             "llama",
             "--sizes",
             "8b",
             "--output",
             str(tmp_path),
-            "--calibration-estimator",
-            "existing-stage-wall-time-v1",
+            "--profiling-method",
+            "stage",
         ],
     )
     campaign.main()
-    assert synthetic["correctness"] == 3  # Physical, base VPP, and refined VPP topologies.
-    assert sum(synthetic[f"{s}.calibrate"] for s in COMPARISON_SCHEDULES) == 2
-    assert sum(synthetic[f"{s}.smoke"] for s in COMPARISON_SCHEDULES) == 7
-    assert synthetic["solve"] == 3  # Never share different algorithms or effective N.
+    assert synthetic["correctness"] == 2  # Native N=PP and explicit logical/VPP topology.
+    assert sum(synthetic[f"{s}.calibrate"] for s in COMPARISON_SCHEDULES) == 1
+    assert sum(synthetic[f"{s}.smoke"] for s in COMPARISON_SCHEDULES) == 5
+    assert synthetic["solve"] == 3  # Never share different method contracts.
     for schedule in COMPARISON_SCHEDULES:
         assert synthetic[f"{schedule}.benchmark"] == 3
         assert synthetic[f"{schedule}.trace"] == 1
     root = tmp_path / "llama/8b/receipts"
     calibration = {
         s: json.loads((root / f"{s}.calibrate.json").read_text())
-        for s in ("octopipe", "slackpipe", "slackpipe-refined")
+        for s in ("octopipe-tuning", "slack-heuristic", "cpsat-no-hint")
     }
-    assert calibration["octopipe"]["profile"] == calibration["slackpipe"]["profile"]
-    assert calibration["slackpipe-refined"]["profile"] != calibration["slackpipe"]["profile"]
+    assert calibration["octopipe-tuning"]["profile"] == calibration["slack-heuristic"]["profile"]
+    assert calibration["cpsat-no-hint"]["profile"] == calibration["slack-heuristic"]["profile"]
     before = synthetic.copy()
     with pytest.raises(RuntimeError, match="Existing/stale receipt"):
         campaign.main()  # Fresh sharing is not implicit resume of a previous campaign.
@@ -807,24 +771,24 @@ def test_fresh_campaign_shares_only_compatible_upstream_work(tmp_path, synthetic
 
 
 def test_campaign_sharing_checks_artifact_integrity(tmp_path, synthetic):
-    first = execute(tmp_path, "solve", schedule="octopipe")
+    first = execute(tmp_path, "solve", schedule="octopipe-tuning")
     shared = [first.receipt_path(s) for s in first.completed]
     calibration = first.completed["calibrate"]
     (tmp_path / calibration["profile"]).write_text("corrupted")
     second = Experiment(args_for(tmp_path, resume=False), shared_receipts=shared)
     second.execute()
-    assert synthetic["slackpipe.calibrate"] == 1
+    assert synthetic["slack-heuristic.calibrate"] == 1
     assert second.completed["calibrate"]["directory"] != calibration["directory"]
 
 
 def test_campaign_sharing_does_not_adopt_unlisted_receipts(tmp_path, synthetic):
-    first = execute(tmp_path, "solve", schedule="octopipe")
+    first = execute(tmp_path, "solve", schedule="octopipe-tuning")
     second = Experiment(
         args_for(tmp_path, resume=False), shared_receipts=[first.receipt_path("env")]
     )
     second.execute()
     assert synthetic["correctness"] == 2
-    assert synthetic["slackpipe.calibrate"] == 1
+    assert synthetic["slack-heuristic.calibrate"] == 1
     assert second.completed["env"]["directory"] == first.completed["env"]["directory"]
 
 
@@ -834,7 +798,7 @@ def test_campaign_rejects_duplicates_before_launch(tmp_path, synthetic, monkeypa
     configs.mkdir()
     model = json.loads(CONFIG.read_text())
     write_json(configs / "llama_8b.json", model)
-    families, sizes, schedules = "llama", "8b", "slackpipe"
+    families, sizes, schedules = "llama", "8b", "slack-heuristic"
     if duplicate == "family":
         families = "llama, llama"
     elif duplicate == "size":
@@ -855,6 +819,8 @@ def test_campaign_rejects_duplicates_before_launch(tmp_path, synthetic, monkeypa
         "argv",
         [
             "campaign",
+            "--num-stages",
+            "8",
             "--configs",
             str(configs),
             "--output",
@@ -863,7 +829,7 @@ def test_campaign_rejects_duplicates_before_launch(tmp_path, synthetic, monkeypa
             families,
             "--sizes",
             sizes,
-            "--schedules",
+            "--methods",
             schedules,
         ],
     )
@@ -875,20 +841,21 @@ def test_campaign_rejects_duplicates_before_launch(tmp_path, synthetic, monkeypa
 
 
 @pytest.mark.parametrize(
-    "schedule,n", [("slackpipe", 8), ("slackpipe-refined", 12), ("interleaved", 8), ("octopipe", 8)]
+    "schedule,n",
+    [("slack-heuristic", 8), ("cpsat-no-hint", 8), ("interleaved-1f1b", 8), ("octopipe-tuning", 8)],
 )
 def test_worker_effective_n_is_applied_once(tmp_path, monkeypatch, schedule, n):
     exp = Experiment(args_for(tmp_path, schedule=schedule))
     commands = []
     monkeypatch.setattr(exp, "_execute", lambda cmd, *rest: commands.append(cmd))
-    exp._worker("calibrate", tmp_path / "calibration", schedule="interleaved")
+    exp._worker("calibrate", tmp_path / "calibration", schedule="interleaved-1f1b")
     exp._worker("smoke", tmp_path / "execution", schedule=schedule)
-    assert commands[0][commands[0].index("--logical-stages") + 1] == n
-    assert commands[1][commands[1].index("--logical-stages") + 1] == 8
+    assert commands[0][commands[0].index("--num-stages") + 1] == n
+    assert commands[1][commands[1].index("--num-stages") + 1] == 8
     assert Experiment(exp.args).topology["num_stages"] == n
 
 
-def test_v2_integrity_and_detailed_diagnostics(tmp_path, synthetic):
+def test_v4_integrity_and_detailed_diagnostics(tmp_path, synthetic):
     exp = execute(tmp_path, "benchmark")
     receipt = exp.completed["benchmark"]
     new = Experiment(args_for(tmp_path, "benchmark", iterations=100))

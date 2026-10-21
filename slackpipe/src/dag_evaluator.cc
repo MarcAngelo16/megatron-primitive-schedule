@@ -22,7 +22,8 @@ void AddEdge(std::vector<std::vector<Edge>>& graph,
 }
 
 std::vector<std::string> ValidateOrders(const Instance& instance,
-                                        const MachineOrders& orders) {
+                                        const MachineOrders& orders,
+                                        bool fifo_ordering) {
   std::vector<std::string> errors;
   if (orders.size() != static_cast<std::size_t>(instance.workers)) {
     errors.push_back(
@@ -33,9 +34,18 @@ std::vector<std::string> ValidateOrders(const Instance& instance,
   std::vector<Index> seen(static_cast<std::size_t>(instance.OperationCount()),
                           0);
   for (Index w = 0; w < instance.workers; ++w) {
+    std::vector<Index> last_batch(static_cast<std::size_t>(2 * instance.stages), -1);
     for (OperationId id : orders[static_cast<std::size_t>(w)]) {
       try {
         const OperationView view = DecodeOperation(instance, id);
+        if (fifo_ordering) {
+          Index& previous = last_batch[static_cast<std::size_t>(view.chain_index)];
+          if (previous >= view.microbatch) {
+            errors.push_back("FIFO_ORDER_VIOLATION worker order reverses " +
+                             OperationName(instance, id));
+          }
+          previous = view.microbatch;
+        }
         ++seen[static_cast<std::size_t>(id.value)];
         if (seen[static_cast<std::size_t>(id.value)] > 1) {
           std::ostringstream msg;
@@ -216,6 +226,12 @@ MachinePredecessors ExtractMachinePredecessors(const Instance& instance,
     for (std::size_t i = 1; i < worker_order.size(); ++i) {
       const OperationView next = DecodeOperation(instance, worker_order[i]);
       const OperationView prev = DecodeOperation(instance, worker_order[i - 1]);
+      // Only forward FIFO edges are redundant. Dropping a reversed edge
+      // would silently turn an impossible worker order into a feasible DAG.
+      if (fifo_ordering && prev.chain_index == next.chain_index &&
+          prev.microbatch >= next.microbatch) {
+        throw Error("FIFO_ORDER_VIOLATION same-position worker order reverses FIFO");
+      }
       if (prev.worker == next.worker &&
           (!fifo_ordering || prev.chain_index != next.chain_index) &&
           !IsDataPredecessor(instance, worker_order[i - 1], worker_order[i])) {
@@ -253,7 +269,7 @@ EvaluationResult EvaluateSchedule(const Instance& instance,
   try {
     instance.Validate();
     ValidateSplit(instance, split);
-    std::vector<std::string> errors = ValidateOrders(instance, orders);
+    std::vector<std::string> errors = ValidateOrders(instance, orders, fifo_ordering);
     const MachinePredecessors predecessors =
         errors.empty()
             ? ExtractMachinePredecessors(instance, orders, fifo_ordering)
@@ -299,6 +315,13 @@ ScheduleMetrics ComputeScheduleMetrics(const Instance& instance,
         CheckedAdd(
             metrics.per_worker_busy_time[static_cast<std::size_t>(op.worker)],
             op.duration, "worker busy time");
+  }
+  // Profile durations can depend on the selected global layer ranges/roles.
+  // Report actual replay work, not the abstract uniform-cost formula.
+  if (instance.HasCostProfile()) {
+    metrics.total_useful_work = 0;
+    for (const auto& op : schedule.operations_by_id)
+      metrics.total_useful_work = CheckedAdd(metrics.total_useful_work, op.duration, "profile useful work");
   }
   for (Index w = 0; w < instance.workers; ++w) {
     const Tick busy = metrics.per_worker_busy_time[static_cast<std::size_t>(w)];

@@ -1,4 +1,10 @@
-# Isolated Quality Dispatch Audit
+# Historical Isolated Quality Dispatch Audit
+
+> Superseded by the [current profiling contract](slackpipe_profiling.md).
+> The old isolated spike/CV gates and stability retries below have been removed.
+> Current layer profiling uses all legal samples and structural reconstruction.
+> Historical GPU measurements and paper-related evidence below are preserved
+> under their original policy; this refactor does not revalidate them.
 
 ## Findings Before Editing
 

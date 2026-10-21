@@ -1,3 +1,5 @@
+> Historical scope: this document records pre-five-method code/results. Commands and method IDs below are not current entry points. Use the [current workflow](slackpipe_five_methods.md); historical results keep their recorded commit and labels.
+
 # Artifact Readiness Audit
 
 Audit date: 2026-09-29. **Publication scope: software fixes and audit checkpoint**,

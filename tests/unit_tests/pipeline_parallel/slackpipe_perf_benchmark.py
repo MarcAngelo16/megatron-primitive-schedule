@@ -1,3 +1,5 @@
+from tools.slackpipe_model_support import _make_batches
+
 # Copyright (c) 2026 NVIDIA CORPORATION. All rights reserved.
 
 """Small controlled SlackPipe PP=2 benchmark.
@@ -181,31 +183,6 @@ def _build_model(args, mode):
                     std /= (2 * args.num_layers) ** 0.5
                 param.normal_(0.0, std, generator=generator)
     return model
-
-
-def _make_batches(args):
-    generator = torch.Generator(device="cpu")
-    generator.manual_seed(args.seed + 17)
-    batches = []
-    for _ in range(args.num_microbatches):
-        tokens = torch.randint(
-            0,
-            args.vocab_size,
-            (args.micro_batch_size, args.seq_length),
-            generator=generator,
-            device="cpu",
-        ).cuda()
-        labels = torch.randint(
-            0,
-            args.vocab_size,
-            (args.micro_batch_size, args.seq_length),
-            generator=generator,
-            device="cpu",
-        ).cuda()
-        position_ids = torch.arange(args.seq_length, device="cuda").view(1, -1)
-        position_ids = position_ids.expand(args.micro_batch_size, -1).contiguous()
-        batches.append({"tokens": tokens, "labels": labels, "position_ids": position_ids})
-    return batches
 
 
 def _batch_iterator(batches):
@@ -409,11 +386,11 @@ def _benchmark_mode(args, mode, rank):
 
 
 def _calibrate_cost_profile(args, plan, rank):
-    from megatron.core.pipeline_parallel.slackpipe.profile_quality import (
+    from megatron.core.pipeline_parallel.slackpipe.profile_integrity import (
         publish_profile,
         tag_calibration_events,
-        thresholds_from_args,
     )
+    from megatron.core.pipeline_parallel.slackpipe.stage_residual import residual_policy_from_args
 
     mode = {
         "name": "cost_calibration_solver_split_interleaved_1f1b",
@@ -463,7 +440,6 @@ def _calibrate_cost_profile(args, plan, rank):
         group="partition0",
         ranges=plan.stage_layer_ranges,
         worker=rank,
-        attempt=args.profiling_attempt,
         raw_path=args.output_dir / "calibration_events.json",
         configuration=dict(
             model=dict(
@@ -521,18 +497,13 @@ def _calibrate_cost_profile(args, plan, rank):
             iteration_end=args.calibration_warmup_iterations + args.calibration_iterations - 1,
             estimator=args.shared_slope_estimator,
             percentile_value=args.shared_slope_percentile,
-            quality_thresholds=thresholds_from_args(args),
+            residual_policy=residual_policy_from_args(args),
         )
         profile["collection"] = dict(provenance, rank_metadata=all_provenance)
         (args.output_dir / "observations.json").write_text(
             json.dumps(profile["observed_stages"], indent=2)
         )
-        publish_profile(
-            args.emit_cost_profile,
-            profile,
-            thresholds=thresholds_from_args(args),
-            attempt=args.profiling_attempt,
-        )
+        publish_profile(args.emit_cost_profile, profile)
     del batches
     del optimizer
     del model
@@ -638,10 +609,10 @@ def _write_summary(args, all_results, plan):
 
 
 def main():
-    from megatron.core.pipeline_parallel.slackpipe.profile_quality import add_quality_arguments
+    from megatron.core.pipeline_parallel.slackpipe.stage_residual import add_residual_arguments
 
     parser = argparse.ArgumentParser()
-    add_quality_arguments(parser)
+    add_residual_arguments(parser)
     parser.add_argument("--plan", type=Path, required=True)
     parser.add_argument("--heterogeneous-config", type=Path)
     parser.add_argument("--output-dir", type=Path, required=True)

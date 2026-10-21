@@ -10,7 +10,7 @@
 #include "slackpipe/octopipe_tuner.h"
 #include "slackpipe/one_f_one_b.h"
 #include "slackpipe/result_validator.h"
-#include "slackpipe/slackpipe_solver.h"
+#include "slackpipe/instance.h"
 
 namespace {
 using namespace slackpipe;
@@ -162,9 +162,8 @@ TEST(OctoPipeDiagnostic, UniqueInitializationsPreserveEqualLoadNotBubbleMagnitud
   const auto interleaved = EvaluateOctoPipeCandidate(
       i, bf.schedule.split, InterleavedOneFOneBOrders(i));
   ASSERT_TRUE(interleaved.has_value());
-  EXPECT_EQ(CanonicalizeEvaluationMethodName("uniform-1f1b"),
-            CanonicalizeEvaluationMethodName("interleaved-1f1b"));
-  EXPECT_EQ(CanonicalizeEvaluationMethodName("uniform-1f1b"), kUniformInterleavedOneFOneBMethod);
+  EXPECT_TRUE(FindEvaluationMethod(kUniformInterleavedOneFOneBMethod) == nullptr);
+  EXPECT_TRUE(FindEvaluationMethod("interleaved-1f1b") != nullptr);
   EXPECT_FALSE(bf.schedule.orders == interleaved->schedule.orders);
   EXPECT_FALSE(ExtractMachinePredecessors(i, bf.schedule.orders) ==
                ExtractMachinePredecessors(i, interleaved->schedule.orders));

@@ -27,6 +27,12 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--gpu", action="store_true", help="Also execute PP=2 FP32 equivalence")
+    parser.add_argument(
+        "--method",
+        choices=("slack-heuristic", "octopipe-tuning", "cpsat-no-hint"),
+        default="slack-heuristic",
+    )
+    parser.add_argument("--solver", type=Path, help="Existing OR-enabled binary for cpsat-no-hint")
     args = parser.parse_args()
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=False)
@@ -81,6 +87,8 @@ def main():
 
     try:
         build = ROOT / "slackpipe/build/no-or"
+        if args.method == "cpsat-no-hint" and args.solver is None:
+            raise ValueError("cpsat-no-hint requires --solver with an OR-enabled binary")
         run(
             [
                 "cmake",
@@ -96,17 +104,19 @@ def main():
             "configure",
         )
         run(["cmake", "--build", build, "-j2"], "build")
-        binary = build / "slackpipe_cli"
+        binary = args.solver.resolve() if args.solver else build / "slackpipe_cli"
         metadata["binary_sha256"] = sha256(binary)
         metadata["build_info"] = json.loads(
-            subprocess.check_output([binary, "build-info"], text=True)
+            subprocess.check_output([binary, "--build-info"], text=True)
         )
         plan = output / "plan.json"
         run(
             [
                 binary,
                 "--algorithm",
-                "uniform-breadth-first",
+                args.method,
+                "--time-limit",
+                1,
                 "--B",
                 4,
                 "--N",
@@ -128,7 +138,7 @@ def main():
             ],
             "solver",
         )
-        run([binary, "validate-result", "--input", output / "solver.json"], "validate")
+        run([binary, "--validate-result", output / "solver.json"], "validate")
         from megatron.core.pipeline_parallel.slackpipe.plan import load_slackpipe_plan
 
         parsed = load_slackpipe_plan(plan, pipeline_model_parallel_size=2)

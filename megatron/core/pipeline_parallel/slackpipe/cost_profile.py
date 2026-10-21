@@ -12,10 +12,11 @@ from typing import Iterable, Mapping, Sequence
 import numpy
 
 from megatron.core.pipeline_parallel.slackpipe.manifest import canonical_json
-from megatron.core.pipeline_parallel.slackpipe.profile_quality import (
-    QualityThresholds,
-    group_consensus,
-    isolate_timing_spikes,
+from megatron.core.pipeline_parallel.slackpipe.stage_residual import (
+    FitStructureError,
+    ResidualPolicy,
+    fit_with_residuals,
+    summarize_operations,
 )
 
 SLACKPIPE_COST_PROFILE_SCHEMA_VERSION = "slackpipe.cost_profile.v1"
@@ -74,12 +75,15 @@ def aggregate_stage_costs(
     num_microbatches: int,
     iteration_start: int,
     iteration_end: int,
-    quality_thresholds: QualityThresholds = QualityThresholds(),
 ) -> list[dict[str, object]]:
-    """Aggregate synchronized compute events into per-stage median costs."""
+    """Validate raw inventory, then aggregate all operation timings without filtering."""
 
-    if num_microbatches <= 0:
+    if type(num_microbatches) is not int or num_microbatches <= 0:
         raise ValueError("num_microbatches must be positive")
+    if not layer_split or any(type(n) is not int or n < 1 for n in layer_split):
+        raise ValueError("Layer split must contain positive integer counts")
+    if type(iteration_start) is not int or type(iteration_end) is not int or iteration_start < 0:
+        raise ValueError("Iteration bounds must be nonnegative integers")
     iterations = list(range(iteration_start, iteration_end + 1))
     if not iterations:
         raise ValueError("iteration range must be non-empty")
@@ -87,16 +91,26 @@ def aggregate_stage_costs(
     samples = defaultdict(list)
     provenance = {}
 
+    seen = set()
     for event in events:
         phase = event.get("phase")
         if phase not in {"forward_compute", "backward_compute"}:
             continue
-        stage = int(event["logical_stage"])
-        iteration = int(event["iteration"])
+        stage = event["logical_stage"]
+        iteration = event["iteration"]
+        if type(stage) is not int or type(iteration) is not int:
+            raise ValueError("Calibration stage and iteration must be integers")
         if not 0 <= stage < num_stages:
             raise ValueError(f"logical stage {stage} is out of range")
         if iteration not in iterations:
             continue
+        microbatch = event.get("microbatch")
+        if type(microbatch) is not int or not 0 <= microbatch < num_microbatches:
+            raise ValueError("Calibration operation requires a valid microbatch ID")
+        key = (iteration, stage, phase, microbatch)
+        if key in seen:
+            raise ValueError(f"Duplicate calibration operation: {key}")
+        seen.add(key)
         identity = {
             k: event[k]
             for k in (
@@ -113,59 +127,28 @@ def aggregate_stage_costs(
         if stage in provenance and provenance[stage] != identity:
             raise ValueError("Cannot aggregate different calibration groups or contexts together")
         provenance[stage] = identity
-        samples[(stage, phase.removesuffix("_compute"))].append(event)
+        sample = dict(event)
+        sample["sample_id"] = (
+            f"{event.get('calibration_group_id', 'group0')}/"
+            f"i{iteration}/s{stage}/{phase}/b{microbatch}"
+        )
+        samples[(stage, phase.removesuffix("_compute"))].append(sample)
 
     rows = []
     for stage, layer_count in enumerate(layer_split):
         phase_diagnostics = {}
         for phase in ("forward", "backward"):
             raw = samples[(stage, phase)]
-            accepted, filtering = isolate_timing_spikes(raw, quality_thresholds)
-            raw_by_iteration, cleaned_by_iteration = defaultdict(list), defaultdict(list)
+            raw_by_iteration = defaultdict(list)
             for event in raw:
                 raw_by_iteration[int(event["iteration"])].append(float(event["elapsed_ms"]))
-            for event in accepted:
-                cleaned_by_iteration[int(event["iteration"])].append(float(event["elapsed_ms"]))
-            raw_totals, cleaned_totals, counts = [], [], []
             for iteration in iterations:
                 values = raw_by_iteration[iteration]
                 if len(values) != num_microbatches:
                     raise ValueError(
                         f"Expected {num_microbatches} calibration events for iteration {iteration}, stage {stage}, phase {phase}; got {len(values)}"
                     )
-                raw_totals.append(sum(values))
-                clean = cleaned_by_iteration[iteration]
-                counts.append(len(clean))
-                # Preserve the old B-normalized scale, but never divide a partial
-                # sum by B. An empty iteration stays zero and fails quality checks.
-                cleaned_totals.append(
-                    sum(clean)
-                    if len(clean) == num_microbatches
-                    else (sum(clean) * num_microbatches / len(clean) if clean else 0.0)
-                )
-
-            def cv(values):
-                mean = statistics.fmean(values)
-                return statistics.pstdev(values) / mean if mean else 0.0
-
-            phase_diagnostics[phase] = dict(
-                samples_ms=cleaned_totals,
-                raw_samples_ms=raw_totals,
-                global_iterations=iterations,
-                accepted_counts_by_iteration=counts,
-                min_ms=min(cleaned_totals),
-                max_ms=max(cleaned_totals),
-                cv=cv(cleaned_totals),
-                raw_cv=cv(raw_totals),
-                cleaned_cv=cv(cleaned_totals),
-                review_required=cv(cleaned_totals) > quality_thresholds.cv,
-                allocation_attribution="unknown: synchronized wall time includes dispatch/allocation stalls; use separate memory diagnosis",
-                samples_discarded=filtering["samples_discarded"],
-                raw_sample_count=filtering["raw_sample_count"],
-                accepted_sample_count=filtering["accepted_sample_count"],
-                discarded_fraction=filtering["discarded_fraction"],
-                outlier_filter=filtering,
-            )
+            phase_diagnostics[phase] = summarize_operations(raw, iterations, num_microbatches)
         forward_totals = phase_diagnostics["forward"]["samples_ms"]
         backward_totals = phase_diagnostics["backward"]["samples_ms"]
         median_forward = statistics.median(forward_totals)
@@ -201,7 +184,7 @@ def build_cost_profile(
     iteration_end: int,
     estimator: str = "min",
     percentile_value: float = 20.0,
-    quality_thresholds: QualityThresholds = QualityThresholds(),
+    residual_policy: ResidualPolicy = ResidualPolicy(),
 ) -> dict[str, object]:
     observed = aggregate_stage_costs(
         events,
@@ -209,17 +192,26 @@ def build_cost_profile(
         num_microbatches=num_microbatches,
         iteration_start=iteration_start,
         iteration_end=iteration_end,
-        quality_thresholds=quality_thresholds,
     )
-    layers = [row["layer_count"] for row in observed]
-    forward_obs = [row["forward_ms_per_op"] for row in observed]
-    backward_obs = [row["backward_ms_per_op"] for row in observed]
-    a_fwd, bias_fwd = fit_shared_slope_stage_bias(
-        layers, forward_obs, estimator=estimator, percentile_value=percentile_value
-    )
-    a_bwd, bias_bwd = fit_shared_slope_stage_bias(
-        layers, backward_obs, estimator=estimator, percentile_value=percentile_value
-    )
+
+    def fit(rows, phase):
+        layers = [row["layer_count"] for row in rows]
+        slope, bias = fit_shared_slope_stage_bias(
+            layers,
+            [row[f"{phase}_ms_per_op"] for row in rows],
+            estimator=estimator,
+            percentile_value=percentile_value,
+        )
+        return dict(
+            slope=slope,
+            bias=bias,
+            estimator=estimator,
+            predicted=[slope * n + b for n, b in zip(layers, bias)],
+        )
+
+    models, final_rows, filtering = fit_with_residuals(observed, fit, residual_policy)
+    a_fwd, bias_fwd = models["forward"]["slope"], models["forward"]["bias"]
+    a_bwd, bias_bwd = models["backward"]["slope"], models["backward"]["bias"]
     return {
         "schema_version": SLACKPIPE_COST_PROFILE_SCHEMA_VERSION,
         "model_config": dict(model_config),
@@ -238,7 +230,13 @@ def build_cost_profile(
         "measured_backward_forward_ratio": a_bwd / a_fwd if a_fwd else None,
         "bias_fwd": bias_fwd,
         "bias_bwd": bias_bwd,
-        "observed_stages": observed,
+        "profiling_backend": "stage",
+        "profiling_policy": residual_policy.identity(),
+        "measurement_parallel_config": dict(parallel_config),
+        "target_parallel_config": dict(parallel_config),
+        "raw_observed_stages": observed,
+        "observed_stages": final_rows,
+        "residual_filter": filtering,
         "measurement_definition": calibration_measurement_definition(),
         "units": "milliseconds",
     }
@@ -250,9 +248,8 @@ def calibration_measurement_definition() -> dict:
         includes="CPU dispatch, compute, allocation/cache stalls inside the call and completion wait",
         excludes="explicit pipeline P2P calls outside stage compute and optimizer step",
         synchronization="device synchronization before/after each calibrated stage call; separate diagnostic run",
-        estimator="median across iteration means of accepted raw microbatch timings; equivalent B-normalized totals retained for diagnostics",
-        filtering="per-group/context/stage/phase upper-tail median+MAD AND median-ratio catastrophic spike filter; raw events unchanged; frequency/consecutive/iteration safeguards required",
-        allocation_stability="not established by timing alone; review sample CV and pair with a separate memory capture",
+        estimator="median of nonempty iteration means; each mean uses its actual retained operation count",
+        filtering="one initial-model relative-residual median/MAD mask per phase, then one refit; raw samples preserved",
         kernel_union_substitution=False,
     )
 
@@ -355,7 +352,7 @@ def fit_heterogeneous_class_costs(
         values.append(float(observed[value_field]))
 
     if len(rows) < len(class_ids):
-        raise ValueError("not enough observed stage rows to fit class costs")
+        raise FitStructureError("not enough observed stage rows to fit class costs")
 
     design = numpy.asarray(rows, dtype=numpy.float64)
     target = numpy.asarray(values, dtype=numpy.float64)
@@ -363,7 +360,7 @@ def fit_heterogeneous_class_costs(
         raise ValueError("heterogeneous calibration costs must be finite and nonnegative")
     solution, residuals, rank, singular_values = numpy.linalg.lstsq(design, target, rcond=None)
     if rank != design.shape[1]:
-        raise ValueError(
+        raise FitStructureError(
             f"rank-deficient heterogeneous calibration ({rank}/{design.shape[1]}); add partitions"
         )
     if numpy.any(solution < -1.0e-12):
@@ -420,7 +417,7 @@ def build_heterogeneous_cost_profile(
     model_config: Mapping[str, object],
     parallel_config: Mapping[str, object],
     units: str = "milliseconds",
-    quality_thresholds: QualityThresholds = QualityThresholds(),
+    residual_policy: ResidualPolicy = ResidualPolicy(),
 ) -> dict[str, object]:
     """Build slackpipe.cost_profile.v2 from stage-level heterogeneous samples."""
 
@@ -430,6 +427,41 @@ def build_heterogeneous_cost_profile(
     observations = []
     for row in observed_stage_rows:
         begin, end = _stage_range(row)
+        _counts_for_range(
+            layer_classes, {c: i for i, c in enumerate(dict.fromkeys(layer_classes))}, begin, end
+        )
+        for phase in ("forward", "backward"):
+            diagnostics = row.get(f"{phase}_diagnostics", {})
+            if "raw_events" not in diagnostics:
+                continue
+            raw = diagnostics["raw_events"]
+            iterations = diagnostics["global_iterations"]
+            batches = diagnostics["num_microbatches"]
+            if (
+                type(batches) is not int
+                or batches < 1
+                or not iterations
+                or any(type(i) is not int or i < 0 for i in iterations)
+                or len(set(iterations)) != len(iterations)
+            ):
+                raise ValueError("Invalid raw observation inventory")
+            actual = [(e["iteration"], e["microbatch"]) for e in raw]
+            expected = {(i, b) for i in iterations for b in range(batches)}
+            if len(actual) != len(expected) or set(actual) != expected:
+                raise ValueError("Missing/duplicate raw observation operations")
+            if any(
+                type(e["iteration"]) is not int
+                or type(e["microbatch"]) is not int
+                or e.get("logical_stage", row["stage"]) != row["stage"]
+                or e.get("phase", phase + "_compute") != phase + "_compute"
+                for e in raw
+            ):
+                raise ValueError("Raw operation stage/phase/index differs from observation")
+            if len({e["sample_id"] for e in raw}) != len(raw):
+                raise ValueError("Duplicate raw operation sample identity")
+            summary = summarize_operations(raw, iterations, batches)
+            if not math.isclose(summary["center_ms"], row[f"{phase}_ms_per_op"], rel_tol=1e-12):
+                raise ValueError("Stage summary does not match unfiltered raw operations")
         composition = layer_classes[begin:end]
         expected_counts = {c: composition.count(c) for c in set(composition)}
         if (
@@ -449,17 +481,21 @@ def build_heterogeneous_cost_profile(
                 model_manifest_hash=model_manifest.get("manifest_hash"),
             )
         )
-    consensus = group_consensus(observations, quality_thresholds)
-    forward_fit = fit_heterogeneous_class_costs(
-        consensus["fit_observations"]["forward"],
-        model_manifest=model_manifest,
-        value_field="forward_ms_per_op",
-    )
-    backward_fit = fit_heterogeneous_class_costs(
-        consensus["fit_observations"]["backward"],
-        model_manifest=model_manifest,
-        value_field="backward_ms_per_op",
-    )
+
+    def fit(rows, phase):
+        return fit_heterogeneous_class_costs(
+            rows, model_manifest=model_manifest, value_field=f"{phase}_ms_per_op"
+        )
+
+    models, final_rows, filtering = fit_with_residuals(observations, fit, residual_policy)
+    policy_identity = residual_policy.identity()
+    if any(report["mask_passes"] == 0 for report in filtering["phases"].values()):
+        policy_identity = dict(
+            policy_version="stage-summary-fit-v1",
+            input_observation_basis="provided summaries; prior sample filtering unknown",
+            residual_filter="not applied without complete raw operations",
+        )
+    forward_fit, backward_fit = models["forward"], models["backward"]
     forward_ms = [forward_fit["class_costs"][class_id] for class_id in layer_classes]
     backward_ms = [backward_fit["class_costs"][class_id] for class_id in layer_classes]
     layer_costs_us = [
@@ -476,10 +512,15 @@ def build_heterogeneous_cost_profile(
         "model_manifest_hash": model_manifest.get("manifest_hash"),
         "measurement_definition": {
             **calibration_measurement_definition(),
-            "group_estimator": "one median of accepted comparable group estimates per phase; separate accepted sets; no raw rows overwritten",
+            "group_estimator": "every calibration group participates; no consensus or group selection",
         },
-        "observed_stages": observations,
-        "group_filter": consensus,
+        "profiling_backend": "stage",
+        "profiling_policy": policy_identity,
+        "measurement_parallel_config": dict(parallel_config),
+        "target_parallel_config": dict(parallel_config),
+        "raw_observed_stages": observations,
+        "observed_stages": final_rows,
+        "residual_filter": filtering,
         "model_config": dict(model_config),
         "parallel_config": dict(parallel_config),
         "class_costs_us": {
@@ -501,7 +542,7 @@ def build_heterogeneous_cost_profile(
         },
         "fit": {
             "forward": {
-                "observation_basis": "group_consensus_medians",
+                "observation_basis": "all_group_iteration_mean_medians_after_one_residual_mask",
                 "rank": forward_fit["rank"],
                 "condition": forward_fit["condition"],
                 "rmse": forward_fit["rmse"],
@@ -510,7 +551,7 @@ def build_heterogeneous_cost_profile(
                 "relative_rmse": forward_fit["relative_rmse"],
             },
             "backward": {
-                "observation_basis": "group_consensus_medians",
+                "observation_basis": "all_group_iteration_mean_medians_after_one_residual_mask",
                 "rank": backward_fit["rank"],
                 "condition": backward_fit["condition"],
                 "rmse": backward_fit["rmse"],

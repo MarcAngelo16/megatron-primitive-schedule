@@ -1,3 +1,5 @@
+> Historical scope: this document records pre-five-method code/results. Commands and method IDs below are not current entry points. Use the [current workflow](../../docs/slackpipe_five_methods.md); historical results keep their recorded commit and labels.
+
 # CAL Evaluation Analysis
 
 `scripts/analyze_cal_results.py` turns manifest-backed CAL runner outputs into

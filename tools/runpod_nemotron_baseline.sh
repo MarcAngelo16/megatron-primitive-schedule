@@ -2,4 +2,6 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}"
-exec "${PYTHON:-python}" -m tools.run_slackpipe_nemotron_h8b_pp4 baseline-smoke "$@"
+exec "${PYTHON:-python}" -m tools.run_slackpipe_eval --phase smoke \
+  --model-config configs/slackpipe_eval/nemotron_h_8b.json \
+  --method interleaved-1f1b --pp 4 --num-stages 8 "$@"

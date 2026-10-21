@@ -1,38 +1,43 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Receipt-gated, immutable real-system experiments; run inside the project container."""
 
-import argparse
 import json
 import os
 import sys
 import uuid
-from dataclasses import asdict
 from pathlib import Path
 
-from megatron.core.pipeline_parallel.slackpipe.profile_quality import (
-    ProfilingQualityError,
-    add_quality_arguments,
-    thresholds_from_args,
+from tools.slackpipe_eval_args import argument_parser, normalize_args
+from tools.slackpipe_eval_common import (
+    DETERMINISTIC,
+    ROOT,
+    digest,
+    require_cuda_devices,
+    run,
+    source_identity,
+    write_json,
 )
-from tools.run_slackpipe_nemotron_h8b_pp4 import DETERMINISTIC, ROOT, digest, run, source_identity
 from tools.slackpipe_eval_config import (
+    METHODS,
     PLAN_SCHEDULES,
-    SCHEDULES,
-    canonical_schedule,
     fingerprint,
     load_model,
     parameter_breakdown,
     schedule_topology,
+    solver_arguments,
 )
 from tools.slackpipe_eval_receipts import (
     RECEIPT_SCHEMA,
     archive_receipt,
     assess_receipt,
     parent_identity,
-    receipt_valid,
 )
-from tools.slackpipe_hybrid import write_json
-from tools.slackpipe_profile_quality import collect_with_retry
+from tools.slackpipe_profiling import (
+    collect_profiles,
+    profiling_policy,
+    stage_calibration_schedule,
+    validate_collection_capabilities,
+)
 
 STAGES = (
     "env",
@@ -45,102 +50,6 @@ STAGES = (
     "full",
     "inspect",
 )
-
-
-def argument_parser() -> argparse.ArgumentParser:
-    from megatron.core.pipeline_parallel.slackpipe.isolated_profile import add_arguments
-
-    parser = argparse.ArgumentParser(description=__doc__)
-    add_arguments(parser)
-    add_quality_arguments(parser)
-    parser.add_argument("stage", choices=STAGES)
-    parser.add_argument("--model-config", type=Path, required=True)
-    parser.add_argument(
-        "--schedule", type=canonical_schedule, choices=SCHEDULES, default="slackpipe"
-    )
-    parser.add_argument("--pp", type=int, default=4)
-    parser.add_argument("--logical-stages", type=int)
-    parser.add_argument("--microbatches", type=int, default=8)
-    parser.add_argument("--micro-batch-size", type=int)
-    parser.add_argument("--seq-length", type=int)
-    parser.add_argument("--precision", choices=("fp32", "bf16"))
-    parser.add_argument("--transport", choices=("nccl-p2p", "nccl-rma"), default="nccl-p2p")
-    parser.add_argument(
-        "--solver", type=Path, default=ROOT / "slackpipe/build/release/slackpipe_cli"
-    )
-    parser.add_argument("--solver-seconds", type=int, default=300)
-    parser.add_argument("--timeout", type=int, default=3600)
-    parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--warmups", type=int, default=5)
-    parser.add_argument("--iterations", type=int, default=50)
-    parser.add_argument("--calibration-iterations", type=int, default=10)
-    parser.add_argument("--calibration-warmups", type=int, default=5)
-    parser.add_argument("--smoke-warmups", type=int, default=5)
-    parser.add_argument("--smoke-iterations", type=int, default=2)
-    parser.add_argument("--trace-warmups", type=int, default=5)
-    parser.add_argument("--repetitions", type=int, default=3)
-    parser.add_argument(
-        "--run-index", type=int, help="Campaign repetition identity; does not change the data seed"
-    )
-    parser.add_argument("--profiler-wait", type=int, default=2)
-    parser.add_argument("--profiler-warmup", type=int, default=2)
-    parser.add_argument("--profiler-active", type=int, default=3)
-    parser.add_argument("--profiler-repeat", type=int, default=3)
-    parser.add_argument("--seed", type=int, default=1234)
-    parser.add_argument("--learning-rate", type=float, default=1e-3)
-    parser.add_argument("--resume", action="store_true")
-    parser.add_argument("--force", action="store_true")
-    parser.add_argument("--explain-receipt", action="store_true")
-    return parser
-
-
-def normalize_args(args):
-    args.schedule = canonical_schedule(args.schedule)
-    model = load_model(args.model_config)
-    for field in ("seq_length", "precision", "micro_batch_size"):
-        if getattr(args, field) is None:
-            setattr(args, field, model["defaults"][field])
-    topology = schedule_topology(args.schedule, args.pp, args.logical_stages, args.microbatches)
-    args.logical_stages = topology.get("base_N", topology["num_stages"])
-    if (
-        topology["num_stages"] > model["num_layers"]
-        or not 1 <= args.seq_length <= model["max_sequence_length"]
-    ):
-        raise ValueError("Invalid stages/sequence for model")
-    if (
-        min(
-            args.warmups,
-            args.iterations,
-            args.repetitions,
-            args.micro_batch_size,
-            args.timeout,
-            args.solver_seconds,
-            args.calibration_warmups,
-            args.smoke_warmups,
-            args.smoke_iterations,
-            args.trace_warmups,
-        )
-        < 1
-    ):
-        raise ValueError("Positive warmup/measurement/run/batch/timeout required")
-    if (
-        args.calibration_iterations < 10
-        or min(args.profiler_wait, args.profiler_warmup) < 0
-        or min(args.profiler_active, args.profiler_repeat) < 1
-    ):
-        raise ValueError("Invalid calibration/profiler schedule")
-    if args.run_index is not None and args.run_index < 0:
-        raise ValueError("run-index must be non-negative")
-    if args.calibration_estimator == "isolated-layer-compute-v1" and (
-        args.isolated_profile_warmups < 1
-        or args.isolated_profile_iterations < 10
-        or not 0 < args.isolated_profile_max_cv < 1
-    ):
-        raise ValueError("Invalid isolated warmup/sample/CV policy")
-    args.output, args.model_config, args.solver = (
-        p.resolve() for p in (args.output, args.model_config, args.solver)
-    )
-    return args
 
 
 def memory_preflight(
@@ -184,21 +93,26 @@ def memory_preflight(
 
 def benchmark_summary(results_by_run: list, global_batch_size: int, seq_length: int) -> dict:
     from megatron.core.pipeline_parallel.slackpipe.collection import summarize_rank_samples
-    from tools.slackpipe_experiment_driver import summarize_samples
+    from tools.slackpipe_eval_common import summarize_samples
 
     runs = [summarize_rank_samples(results) for results in results_by_run]
-    summary = summarize_samples([r["max_rank_iteration_ms"] for r in runs])
+    event_summary = summarize_samples([r["max_rank_iteration_ms"] for r in runs])
+    walls = [r["continuous_wall_ms"] / len(r["iterations"]) for r in runs]
+    summary = summarize_samples([[wall] for wall in walls])
     if len(runs) == 1:
         summary["ci95_ms"] = None
         summary["rep_mean_stddev_ms"] = None
-    walls = [r["continuous_wall_ms"] / len(r["iterations"]) for r in runs]
+        event_summary["ci95_ms"] = None
+        event_summary["rep_mean_stddev_ms"] = None
     wall_mean = sum(walls) / len(walls)
     memories = [
         m for results in results_by_run for r in results for m in r["memory_boundaries"].values()
     ]
     return dict(
-        schema_version="slackpipe.eval_benchmark.v1",
+        schema_version="slackpipe.eval_benchmark.v2",
         **summary,
+        summary_metric="max-rank continuous window wall time / measured steps",
+        cuda_event_summary=event_summary,
         config=results_by_run[0][0]["config"],
         collection_provenance=[
             dict(
@@ -209,13 +123,16 @@ def benchmark_summary(results_by_run: list, global_batch_size: int, seq_length: 
             for r in results_by_run
         ],
         runs=runs,
+        timed_steps_by_run=[len(r["iterations"]) for r in runs],
+        continuous_window_observations=len(walls),
         continuous_step_ms_by_run=walls,
         continuous_mean_ms=wall_mean,
+        continuous_ci95_ms=summary["ci95_ms"],
         samples_per_second=global_batch_size * 1000 / wall_mean,
         tokens_per_second=global_batch_size * seq_length * 1000 / wall_mean,
         peak_allocated_bytes=max(m["peak_allocated_bytes"] for m in memories),
         peak_reserved_bytes=max(m["peak_reserved_bytes"] for m in memories),
-        ci_definition="normal approximation across independent run means; null for one run",
+        ci_definition="95% normal-approximation half-width across independent continuous-window step means; null for one run",
         throughput_definition="synchronized continuous wall window; not per-operation trace envelopes",
     )
 
@@ -253,11 +170,11 @@ class Experiment:
         args = self.args
         import torch
 
-        environment = (
-            environment_metadata() if torch.cuda.is_available() else dict(cuda_available=False)
-        )
+        available = torch.cuda.is_available()
+        environment = environment_metadata() if available else dict(cuda_available=False)
         environment["visible_gpu_uuids"] = [
-            str(torch.cuda.get_device_properties(i).uuid) for i in range(torch.cuda.device_count())
+            str(torch.cuda.get_device_properties(i).uuid)
+            for i in range(torch.cuda.device_count() if available else 0)
         ]
         environment["worker_deterministic_environment"] = DETERMINISTIC
         self._identity = dict(
@@ -275,83 +192,42 @@ class Experiment:
     def _context(self, stage, parents):
         """Fingerprint actual stage inputs, never a campaign-wide measurement policy."""
         args = self.args
-        context = dict(self._base_context(), context_schema_version=2, stage=stage)
+        context = dict(self._base_context(), context_schema_version=4, stage=stage)
         context["parents"] = {k: parent_identity(v) for k, v in parents.items()}
         if stage not in ("env", "correctness"):
             context.update(seed=args.seed, learning_rate=args.learning_rate)
-        if stage not in ("env", "correctness", "solve"):
+        if stage not in ("env", "correctness", "solve", "calibrate"):
             context["schedule"] = (
-                ("1f1b" if self.topology["num_stages"] == args.pp else "interleaved")
-                if stage in ("native-smoke", "calibrate")
+                ("1f1b" if self.topology["num_stages"] == args.pp else "interleaved-1f1b")
+                if stage == "native-smoke"
                 else args.schedule
             )
         policy = {}
         if stage in ("smoke", "native-smoke"):
             policy = dict(warmups=args.smoke_warmups, iterations=args.smoke_iterations)
         elif stage == "calibrate":
-            from megatron.core.pipeline_parallel.slackpipe.isolated_profile import (
-                ESTIMATOR,
-                IsolatedPolicy,
-                class_mapping,
-                execution_signature,
+            policy = profiling_policy(args)
+            context["calibration_schedules"] = {
+                backend: identity.get("calibration_schedule", "artifact-import")
+                for backend, identity in policy["backends"].items()
+            }
+            policy["stage_partitions"] = (
+                "class-identifiable-v1" if self.model["model_family"] == "nemotron_h" else "uniform"
             )
-
-            if args.calibration_estimator == ESTIMATOR:
-                from megatron.core.pipeline_parallel.slackpipe.manifest import build_model_manifest
-                from tools.slackpipe_eval_config import transformer_config
-
-                manifest = build_model_manifest(
-                    transformer_config(self.model, dict(pp=1, vpp=None), args.precision)
-                )
-                execution = execution_signature(
-                    self.model,
-                    seq_length=args.seq_length,
-                    micro_batch_size=args.micro_batch_size,
-                    precision=args.precision,
-                )
-                policy = dict(
-                    estimator=ESTIMATOR,
-                    warmups=args.isolated_profile_warmups,
-                    iterations=args.isolated_profile_iterations,
-                    statistic="median",
-                    quality_schema="slackpipe.isolated_profile_quality.v1",
-                    quality=asdict(IsolatedPolicy(max_cv=args.isolated_profile_max_cv)),
-                    automatic_retry_limit=1,
-                    model_manifest_hash=manifest["manifest_hash"],
-                    execution=execution,
-                    class_signatures=[
-                        c["class_signature"] for c in class_mapping(manifest, execution)
-                    ],
-                )
-                context["schedule"] = "isolated-no-pipeline"
-            else:
-                policy = dict(
-                    warmups=args.calibration_warmups,
-                    iterations=args.calibration_iterations,
-                    partitions=(
-                        "class-identifiable-v1"
-                        if self.model["model_family"] == "nemotron_h"
-                        else "uniform"
-                    ),
-                    estimator="existing-stage-wall-time-v1",
-                    quality=asdict(thresholds_from_args(args)),
-                    quality_schema="slackpipe.profile_quality.v3",
-                    automatic_retry_limit=1,
-                )
         elif stage == "solve":
             context.update(
                 solver_sha256=digest(args.solver) if args.solver.is_file() else None,
                 solver_seconds=args.solver_seconds,
-                solver_algorithm=(
-                    "octopipe-algorithm1-fixed-stage"
-                    if args.schedule == "octopipe"
-                    else "joint-unrestricted-no-overlap"
-                ),
-                solver_workers=1 if args.schedule == "octopipe" else 2,
+                method_contract=METHODS[args.schedule].contract(),
+                solver_algorithm=METHODS[args.schedule].backend,
+                solver_workers=args.solver_workers,
+                activation_cap_units=args.activation_cap_units,
                 require_optimal=False,
                 ratio=[1, 1],
+                communication_model="constant_inter_worker_dependency_delay",
+                communication_ticks=0,
             )
-            if args.schedule == "octopipe":
+            if args.schedule == "octopipe-tuning":
                 context.update(
                     octopipe_fixed_placement=True, octopipe_initial_order="uniform-breadth-first"
                 )
@@ -376,6 +252,9 @@ class Experiment:
                 trace_format="slackpipe.figure_trace.v2",
                 profiler="cpu+cuda;no-shapes-stack-memory",
             )
+        if stage in ("solve", "smoke", "benchmark", "trace"):
+            context["method_contract"] = METHODS[args.schedule].contract()
+            context["executor"] = METHODS[args.schedule].executor
         context["policy"] = policy
         return context
 
@@ -385,7 +264,7 @@ class Experiment:
             "env": (),
             "correctness": ("env",),
             "native-smoke": ("correctness",),
-            "calibrate": ("native-smoke",),
+            "calibrate": ("correctness",),
             "solve": ("calibrate",),
             "smoke": ("solve",) if optimized else ("correctness",),
             "benchmark": ("smoke",),
@@ -409,9 +288,14 @@ class Experiment:
         plan=None,
         profile=None,
         iterations=None,
-        attempt=0,
+        backend="stage",
     ):
         args = self.args
+        if stage == "calibrate" and backend == "stage":
+            native = stage_calibration_schedule(args)
+            if schedule is not None and schedule != native:
+                raise ValueError("Stage calibration must use native interleaved-1f1b")
+            schedule = native
         warmups = {
             "calibrate": args.calibration_warmups,
             "smoke": args.smoke_warmups,
@@ -428,19 +312,16 @@ class Experiment:
         command = self.torchrun + [
             "-m",
             "tools.slackpipe_eval_worker",
+            "--phase",
             stage,
             "--model-config",
             args.model_config,
-            "--schedule",
+            "--method",
             schedule or args.schedule,
             "--pp",
             args.pp,
-            "--logical-stages",
-            (
-                args.logical_stages
-                if (schedule or args.schedule) == "slackpipe-refined"
-                else self.topology["num_stages"]
-            ),
+            "--num-stages",
+            self.topology["num_stages"],
             "--microbatches",
             args.microbatches,
             "--micro-batch-size",
@@ -475,31 +356,43 @@ class Experiment:
         if plan:
             command += ["--plan", plan, "--profile", profile]
         if stage == "calibrate":
-            command += ["--profiling-attempt", attempt]
-            command += ["--calibration-estimator", args.calibration_estimator]
-            if args.calibration_estimator == "isolated-layer-compute-v1":
+            command += ["--profiling-method", backend]
+            if backend == "layer":
                 command = [
                     sys.executable,
                     "-m",
                     "tools.slackpipe_isolated_profile",
                     *command[command.index("tools.slackpipe_eval_worker") + 1 :],
                 ]
-                for name in (
-                    "isolated_profile_warmups",
-                    "isolated_profile_iterations",
-                    "isolated_profile_max_cv",
-                ):
+                for name in ("isolated_profile_warmups", "isolated_profile_iterations"):
                     command += ["--" + name.replace("_", "-"), getattr(args, name)]
             else:
-                for key, value in asdict(thresholds_from_args(args)).items():
-                    command += [f"--quality-{key.replace('_', '-')}", value]
+                command += [
+                    "--stage-residual-k",
+                    args.stage_residual_k,
+                    "--stage-residual-rho",
+                    args.stage_residual_rho,
+                ]
         self._execute(command, directory.parent, directory.name)
 
     def ensure(self, stage):
+        validate_collection_capabilities(self.args, stage)
+        if stage == "env":
+            # This launcher uses single-node torchrun with TP=DP=CP=1.
+            # Check before receipt reuse/context queries or starting any workers.
+            require_cuda_devices(self.args.pp)
         if stage in self.completed:
             return self.completed[stage]
         args = self.args
         optimized = args.schedule in PLAN_SCHEDULES
+        if stage == "solve" and not optimized:
+            return dict(
+                status="not_applicable",
+                stage=stage,
+                method_id=args.schedule,
+                executor=METHODS[args.schedule].executor,
+                solver=None,
+            )
         parents = {p: self.ensure(p) for p in self.dependencies(stage)}
         if any(p["status"] != "passed" for p in parents.values()):
             result = dict(
@@ -570,8 +463,16 @@ class Experiment:
             context=context,
             context_hash=fingerprint(context),
             schedule=args.schedule,
+            method_id=args.schedule,
+            executor=METHODS[args.schedule].executor,
+            transport=args.transport if optimized else "megatron-p2p",
+            solver_profile=args.solver_profile if optimized else None,
             directory=str(directory.relative_to(self.output)),
         )
+        if not optimized:
+            result["solver"] = None
+        if optimized and stage in ("solve", "smoke", "benchmark", "trace"):
+            result["profile_identity"] = self.completed["calibrate"]["profile_identity"]
         plan = profile = None
         if optimized and stage in ("smoke", "benchmark", "trace"):
             solver = self.completed["solve"]
@@ -620,21 +521,43 @@ class Experiment:
                     "small hybrid numerical-equivalence fixture at requested PP/precision; target model validated separately by smoke"
                 )
             elif stage == "calibrate":
-                native = "1f1b" if self.topology["num_stages"] == args.pp else "interleaved"
-                selected = collect_with_retry(
+                from tools.slackpipe_eval_worker import validate_profile
+
+                collection = collect_profiles(
                     directory,
-                    lambda worker, attempt: self._worker(
+                    args,
+                    lambda backend, worker: self._worker(
                         "calibrate",
                         worker,
-                        schedule=native,
+                        schedule="interleaved-1f1b" if backend == "stage" else args.schedule,
                         iterations=args.calibration_iterations,
-                        attempt=attempt,
+                        backend=backend,
                     ),
-                    context,
+                    lambda profile: validate_profile(
+                        profile,
+                        self.model,
+                        self.topology,
+                        args.precision,
+                        args.seq_length,
+                        args.micro_batch_size,
+                    ),
                 )
-                result["profile"] = str(selected.relative_to(self.output))
+                result["collection_status"] = collection["status"]
+                result["profiling_method"] = args.profiling_method
+                result["solver_profile"] = args.solver_profile
+                result["backend_status"] = {
+                    key: value["status"] for key, value in collection["backends"].items()
+                }
+                result["profile"] = str(
+                    Path(collection["selected_profile"]).relative_to(self.output)
+                )
+                selected_backend = collection["backends"][args.solver_profile]
+                result["profile_identity"] = {
+                    key: selected_backend[key]
+                    for key in ("backend", "sha256", "cost_profile_hash", "policy")
+                }
             elif stage in ("smoke", "native-smoke"):
-                native = "1f1b" if self.topology["num_stages"] == args.pp else "interleaved"
+                native = "1f1b" if self.topology["num_stages"] == args.pp else "interleaved-1f1b"
                 self._worker(
                     "smoke" if stage == "native-smoke" else stage,
                     directory / "worker",
@@ -664,8 +587,12 @@ class Experiment:
                 self._execute(
                     [
                         args.solver,
-                        "--algorithm",
-                        context["solver_algorithm"],
+                        *solver_arguments(
+                            args.schedule,
+                            args.solver_seconds,
+                            args.solver_workers,
+                            args.activation_cap_units,
+                        ),
                         "--B",
                         args.microbatches,
                         "--N",
@@ -678,55 +605,68 @@ class Experiment:
                         1,
                         "--ratio-den",
                         1,
-                        "--time-limit-seconds",
-                        args.solver_seconds,
-                        "--num-workers",
-                        context["solver_workers"],
-                        "--random-seed",
+                        "--communication",
+                        0,
+                        "--seed",
                         args.seed,
-                        "--require-optimal",
-                        "false",
                         "--cost-profile",
                         profile,
                         "--output-prefix",
                         directory / "solver",
                         "--emit-plan",
                         plan,
-                    ]
-                    + (
-                        ["--octopipe-fixed-placement", "true"]
-                        if args.schedule == "octopipe"
-                        else []
-                    ),
+                    ],
                     directory,
                     "solve",
                 )
-                parsed = load_slackpipe_plan(plan, pipeline_model_parallel_size=args.pp)
-                validate_cyclic_placement(parsed)
-                if (parsed.num_layers, parsed.num_stages, parsed.num_microbatches) != (
-                    self.model["num_layers"],
-                    self.topology["num_stages"],
-                    args.microbatches,
-                ):
-                    raise ValueError("Solver plan dimensions differ from experiment")
-                if (
-                    parsed.schema_version == "slackpipe.plan.v2"
-                    and parsed.cost_profile_hash != profile_data["cost_profile_hash"]
-                ):
-                    raise ValueError("Solver plan profile provenance mismatch")
-                if parsed.schema_version == "slackpipe.plan.v1":
-                    write_json(
-                        plan.with_suffix(".binding.json"),
-                        dict(
-                            schema_version="slackpipe.eval_plan_binding.v1",
-                            plan_sha256=digest(plan),
-                            profile_sha256=digest(profile),
-                        ),
+                outcome = json.loads((directory / "solver.json").read_text())
+                if outcome["method_id"] != args.schedule or outcome["schema_version"] != 2:
+                    raise ValueError("Solver method contract mismatch")
+                result["solver_result"] = str((directory / "solver.json").relative_to(self.output))
+                if not outcome["final_solution_available"]:
+                    if plan.exists():
+                        raise ValueError("No-solution solver unexpectedly emitted a plan")
+                    result.update(
+                        status="no_valid_solution", solver_status_raw=outcome["solver_status_raw"]
                     )
-                from tools.slackpipe_eval_worker import validate_plan_provenance
+                else:
+                    self._execute(
+                        [
+                            args.solver,
+                            "--validate-result",
+                            directory / "solver.json",
+                            "--validation-output",
+                            directory / "independent_validation.json",
+                        ],
+                        directory,
+                        "validate",
+                    )
+                    parsed = load_slackpipe_plan(plan, pipeline_model_parallel_size=args.pp)
+                    validate_cyclic_placement(parsed)
+                    if (parsed.num_layers, parsed.num_stages, parsed.num_microbatches) != (
+                        self.model["num_layers"],
+                        self.topology["num_stages"],
+                        args.microbatches,
+                    ):
+                        raise ValueError("Solver plan dimensions differ from experiment")
+                    if (
+                        parsed.schema_version == "slackpipe.plan.v2"
+                        and parsed.cost_profile_hash != profile_data["cost_profile_hash"]
+                    ):
+                        raise ValueError("Solver plan profile provenance mismatch")
+                    if parsed.schema_version == "slackpipe.plan.v1":
+                        write_json(
+                            plan.with_suffix(".binding.json"),
+                            dict(
+                                schema_version="slackpipe.eval_plan_binding.v1",
+                                plan_sha256=digest(plan),
+                                profile_sha256=digest(profile),
+                            ),
+                        )
+                    from tools.slackpipe_eval_worker import validate_plan_provenance
 
-                validate_plan_provenance(plan, profile, profile_data)
-                result["plan"] = str(plan.relative_to(self.output))
+                    validate_plan_provenance(plan, profile, profile_data)
+                    result["plan"] = str(plan.relative_to(self.output))
             else:
                 runs = []
                 repetitions = (
@@ -756,10 +696,7 @@ class Experiment:
                 if p.is_file()
             }
         except Exception as exc:
-            result.update(
-                status="rerun_required" if isinstance(exc, ProfilingQualityError) else "failed",
-                error=str(exc),
-            )
+            result.update(status="failed", error=str(exc))
             result["artifacts"] = {
                 str(p.relative_to(self.output)): digest(p)
                 for p in directory.rglob("*")

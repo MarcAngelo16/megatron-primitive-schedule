@@ -77,7 +77,7 @@ def test_aggregate_stage_costs_uses_iteration_medians_and_normalizes_by_microbat
     assert rows[0]["forward_diagnostics"]["samples_ms"] == [4, 12, 20]
     assert rows[0]["forward_diagnostics"]["global_iterations"] == [2, 3, 4]
     assert rows[0]["forward_diagnostics"]["samples_discarded"] == 0
-    assert rows[0]["forward_diagnostics"]["review_required"]
+    assert "review_required" not in rows[0]["forward_diagnostics"]
 
 
 def test_build_cost_profile_schema_and_biases():
@@ -159,6 +159,20 @@ def test_stage_role_labels_pipeline_positions():
     assert stage_role(1, 4) == "middle"
     assert stage_role(2, 4) == "middle"
     assert stage_role(3, 4) == "last"
+
+
+def test_summary_only_input_does_not_claim_raw_residual_policy():
+    result = build_heterogeneous_cost_profile(
+        model_manifest=_heterogeneous_manifest(),
+        observed_stage_rows=_heterogeneous_observations(),
+        model_config={},
+        parallel_config={},
+    )
+    assert result["profiling_policy"]["policy_version"] == "stage-summary-fit-v1"
+    for phase in ("forward", "backward"):
+        report = result["residual_filter"]["phases"][phase]
+        assert report["status"] == "filter_not_applied"
+        assert report["reason"] == "raw_operation_samples_unavailable"
 
 
 def test_fit_heterogeneous_class_costs_from_stage_level_observations():

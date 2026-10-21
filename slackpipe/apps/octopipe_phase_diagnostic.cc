@@ -9,7 +9,7 @@
 #include "slackpipe/io.h"
 #include "slackpipe/octopipe_tuner.h"
 #include "slackpipe/one_f_one_b.h"
-#include "slackpipe/slackpipe_solver.h"
+#include "slackpipe/instance.h"
 
 namespace {
 using namespace slackpipe;

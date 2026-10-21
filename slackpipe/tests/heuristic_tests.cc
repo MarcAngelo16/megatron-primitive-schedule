@@ -6,9 +6,9 @@
 #include "slackpipe/breadth_first.h"
 #include "slackpipe/dag_evaluator.h"
 #include "slackpipe/io.h"
-#include "slackpipe/joint_solver.h"
 #include "slackpipe/result_validator.h"
-#include "slackpipe/slackpipe_solver.h"
+#include "slackpipe/instance.h"
+#include "slackpipe/slack_heuristic.h"
 
 namespace {
 using namespace slackpipe;
@@ -36,8 +36,8 @@ template <typename F> bool Throws(F f) {
   try { f(); } catch (const Error&) { return true; }
   return false;
 }
-HeuristicHintOptions Fixed(Index count) {
-  HeuristicHintOptions o;
+SlackHeuristicOptions Fixed(Index count) {
+  SlackHeuristicOptions o;
   o.fixed_evaluation_test = true;
   o.evaluation_limit = count;
   o.record_trace = true;
@@ -225,10 +225,10 @@ TEST(Heuristic, DebugReplayAndFinalGeneralValidation) {
   auto in = Tiny();
   auto options = Fixed(600);
   options.verify_cached_replay = true;
-  const auto result = BuildHeuristicIncumbent(in, options);
-  EXPECT_TRUE(result.hint_candidates_simulated <= 600);
+  const auto result = SolveSlackHeuristic(in, options);
+  EXPECT_TRUE(result.evaluations <= 600);
   EXPECT_TRUE(result.makespan_ticks <= Baseline(in).makespan);
-  EXPECT_TRUE(ValidateScheduleSolutionIndependent(in, result.schedule, result.status, "heuristic").passed);
+  EXPECT_TRUE(ValidateScheduleSolutionIndependent(in, result.schedule, result.status, "slack-heuristic").passed);
   EXPECT_TRUE(ValidateResultJsonText(ToJson(in, result)).passed);
   EXPECT_TRUE(result.heuristic_metadata_json.find("\"outer_pd_calls\":0") != std::string::npos);
 }
@@ -240,14 +240,13 @@ TEST(Heuristic, FixedEvaluationDeterministicSingleParentTrajectory) {
   in.profile_forward_bias_ticks = {0,2,0,4};
   in.profile_backward_bias_ticks = {1,0,2,0};
   auto options = Fixed(40000);
-  const auto a = BuildHeuristicIncumbent(in, options);
+  const auto a = SolveSlackHeuristic(in, options);
   options.time_limit_seconds = .000001; // No wall-triggered truncation in test mode.
-  const auto b = BuildHeuristicIncumbent(in, options);
+  const auto b = SolveSlackHeuristic(in, options);
   EXPECT_TRUE(a.split == b.split);
   EXPECT_TRUE(a.machine_orders == b.machine_orders);
-  EXPECT_TRUE(ValidateResultJsonText(ToJson(in, a)).passed);
-  EXPECT_EQ(a.hint_candidates_simulated, b.hint_candidates_simulated);
-  EXPECT_EQ(a.hint_iterations, b.hint_iterations);
+  EXPECT_EQ(a.evaluations, b.evaluations);
+  EXPECT_EQ(a.iterations, b.iterations);
   ASSERT_EQ(a.incumbent_trace.size(), b.incumbent_trace.size());
   for (std::size_t k = 0; k < a.incumbent_trace.size(); ++k)
     EXPECT_EQ(a.incumbent_trace[k].second, b.incumbent_trace[k].second);
@@ -258,30 +257,11 @@ TEST(Heuristic, RejectsUnsupportedSettingsAndHonorsPartitionPredicate) {
   auto in = Tiny();
   auto options = Fixed(100);
   options.allowed_partition = [](const auto&) { return false; };
-  EXPECT_TRUE(Throws([&] { (void)BuildHeuristicIncumbent(in, options); }));
+  EXPECT_TRUE(Throws([&] { (void)SolveSlackHeuristic(in, options); }));
   options = Fixed(100); options.refinement_mode = "beam";
-  EXPECT_TRUE(Throws([&] { (void)BuildHeuristicIncumbent(in, options); }));
-  options.refinement_mode = "pd_then_refine";
-  EXPECT_TRUE(Throws([&] { (void)BuildHeuristicIncumbent(in, options); }));
+  EXPECT_TRUE(Throws([&] { (void)SolveSlackHeuristic(in, options); }));
   options = Fixed(100); in.stage_to_worker = {0,0,1,1};
-  EXPECT_TRUE(Throws([&] { (void)BuildHeuristicIncumbent(in, options); }));
-}
-
-TEST(Heuristic, PrefixCostsSurviveIndependentResultRoundTrip) {
-  auto in = Tiny();
-  in.profile_prefix_forward_ticks = {0,1,3,7,15,31,63,127,255,511,1023,2047,4095};
-  in.profile_prefix_backward_ticks = {0,3,4,9,11,18,22,30,33,39,44,53,60};
-  in.profile_role_forward_bias_ticks = {2,0,5};
-  in.profile_role_backward_bias_ticks = {7,1,8};
-  auto result = BuildHeuristicIncumbent(in, Fixed(300));
-  const auto json = ToJson(in, result);
-  EXPECT_TRUE(ValidateResultJsonText(json).passed);
-  auto abstract = in;
-  abstract.profile_prefix_forward_ticks.clear();
-  abstract.profile_prefix_backward_ticks.clear();
-  abstract.profile_role_forward_bias_ticks.clear();
-  abstract.profile_role_backward_bias_ticks.clear();
-  EXPECT_TRUE(!ValidateResultJsonText(ToJson(abstract, result)).passed);
+  EXPECT_TRUE(Throws([&] { (void)SolveSlackHeuristic(in, options); }));
 }
 
 TEST(Heuristic, LargeStageNeighborhoodAndBoundCertificates) {
@@ -289,70 +269,13 @@ TEST(Heuristic, LargeStageNeighborhoodAndBoundCertificates) {
   in.stages = 20; in.total_layers = 60; in.workers = 4;
   auto options = Fixed(2500);
   options.verify_cached_replay = true;
-  auto r = BuildHeuristicIncumbent(in, options);
+  auto r = SolveSlackHeuristic(in, options);
   EXPECT_TRUE(r.makespan_ticks <= Baseline(in).makespan);
   EXPECT_TRUE(ValidateResultJsonText(ToJson(in, r)).passed);
   EXPECT_TRUE(r.best_bound_ticks <= r.makespan_ticks);
   in.workers = 1;
-  r = BuildHeuristicIncumbent(in, Fixed(1));
+  r = SolveSlackHeuristic(in, Fixed(1));
   EXPECT_TRUE(r.proven_optimal);
   EXPECT_EQ(r.best_bound_ticks, r.makespan_ticks);
-  EXPECT_EQ(r.hint_termination_reason, std::string("validated_lower_bound"));
-}
-
-TEST(Heuristic, JointIntegrationBudgetAndHintValidation) {
-  if (!IsJointOptimizerAvailable()) return;
-  auto in = Tiny();
-  JointOptimizerOptions options;
-  options.time_limit_seconds = 1;
-  options.require_optimal = false;
-  options.incumbent_method = "heuristic";
-  options.heuristic_options.evaluation_limit = 500;
-  auto r = OptimizeJointSplitAndScheduleCpSat(in, options);
-  EXPECT_EQ(r.bfs_incumbent.method, std::string("heuristic"));
-  EXPECT_TRUE(r.incumbent_valid);
-  EXPECT_TRUE(r.incumbent_hints_effective);
-  EXPECT_TRUE(r.joint_budget_seconds < options.time_limit_seconds);
-  EXPECT_TRUE(ValidateScheduleSolutionIndependent(in, r.schedule, r.status, "joint").passed);
-}
-
-TEST(Heuristic, JointRangeProfileRetainsCapAndFixedPartitionScreening) {
-  if (!IsJointOptimizerAvailable()) return;
-  Instance in;
-  in.microbatches = 2; in.stages = 2; in.workers = 2; in.total_layers = 4;
-  in.profile_prefix_forward_ticks = {0,1,3,6,10};
-  in.profile_prefix_backward_ticks = {0,3,5,9,14};
-  in.profile_role_forward_bias_ticks = {1,0,2};
-  in.profile_role_backward_bias_ticks = {2,0,1};
-  JointOptimizerOptions options;
-  options.time_limit_seconds = 2;
-  options.require_optimal = false;
-  options.incumbent_method = "heuristic";
-  options.heuristic_options.evaluation_limit = 1000;
-  PartitionRestriction restriction;
-  restriction.mode = SlackPipeSplitMode::kFixed;
-  restriction.reference_split = {2,2};
-  options.partition_restriction = restriction;
-  options.activation_options.model = ActivationModel::kCount;
-  options.activation_options.cap_mode = ActivationCapMode::kExplicit;
-  options.activation_options.activation_cap_units = {1,1};
-  options.activation_options.enforce_activation_cap = true;
-  auto r = OptimizeJointSplitAndScheduleCpSat(in, options);
-  EXPECT_TRUE(r.split == restriction.reference_split);
-  EXPECT_TRUE(ActivationScheduleSatisfiesCap(in, r.schedule, options.activation_options));
-  EXPECT_TRUE(ValidateScheduleSolutionIndependent(in, r.schedule, r.status, "joint").passed);
-}
-
-TEST(Heuristic, SlackPipeReferenceIntegrationUsesSameHint) {
-  if (!IsSlackPipeSolverAvailable()) return;
-  auto in = Tiny();
-  SlackPipeOptions options;
-  options.bfs_method = "heuristic";
-  options.time_limit_seconds = 1;
-  options.heuristic_options.evaluation_limit = 500;
-  options.split_mode = SlackPipeSplitMode::kWorkerFixed;
-  auto r = SolveCanonicalSlackPipe(in, options);
-  EXPECT_EQ(r.bfs.method, std::string("heuristic"));
-  EXPECT_TRUE(WorkerLayerTotals(in, r.split) == WorkerLayerTotals(in, r.bfs.split));
-  EXPECT_TRUE(ValidateScheduleSolutionIndependent(in, r.schedule, r.status, "slackpipe").passed);
+  EXPECT_EQ(r.termination_reason, std::string("validated_lower_bound"));
 }

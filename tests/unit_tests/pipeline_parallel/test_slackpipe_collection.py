@@ -16,7 +16,7 @@ from megatron.core.pipeline_parallel.slackpipe.figure_trace import (
 )
 from tests.unit_tests.pipeline_parallel.test_slackpipe_figure_trace import raw_trace
 from tools.plot_schedule_trace import available_iterations, load_panel, plot_time_bounds
-from tools.slackpipe_experiment_driver import summarize_samples
+from tools.slackpipe_eval_common import summarize_samples
 
 
 def test_union_not_envelope_or_sum():

@@ -2,6 +2,7 @@
 import os
 from datetime import timedelta
 
+import pytest
 import torch
 from torch._C._distributed_c10d import PrefixStore
 from torch.distributed import rendezvous
@@ -41,8 +42,40 @@ class Utils:
     store = None
 
     @staticmethod
+    def require_cuda_devices(required_devices: int | None = None) -> int:
+        """Skip only unmet GPU prerequisites, before binding or distributed setup.
+
+        Use local process count, not PP alone: TP/DP/CP ranks also need devices.
+        Explicit requirements are used by single-node numerical fixtures.
+        Probe exceptions intentionally propagate.
+        """
+        required = (
+            int(os.environ.get('LOCAL_WORLD_SIZE', str(Utils.world_size)))
+            if required_devices is None
+            else required_devices
+        )
+        if required < 1:
+            raise ValueError(f'Invalid required CUDA device count: {required}')
+        available = torch.cuda.is_available()
+        count = torch.cuda.device_count()
+        observed = f'required={required}, cuda_available={available}, visible_devices={count}'
+        if count == 0:
+            pytest.skip(f'No visible CUDA devices ({observed})')
+        if not available:
+            pytest.skip(f'CUDA unavailable ({observed})')
+        if count < required:
+            pytest.skip(f'Insufficient CUDA devices ({observed})')
+        return count
+
+    @staticmethod
     def initialize_distributed():
 
+        if Utils.rank >= 0:
+            device_count = Utils.require_cuda_devices()
+            if Utils.rank >= device_count:
+                raise ValueError(
+                    f'Invalid local rank {Utils.rank}; visible CUDA devices={device_count}'
+                )
         os.environ.pop('NVTE_FLASH_ATTN', None)
         os.environ.pop('NVTE_FUSED_ATTN', None)
         os.environ.pop('NVTE_UNFUSED_ATTN', None)
@@ -52,7 +85,7 @@ class Utils:
                 f'Initializing torch.distributed with rank: {Utils.rank}, '
                 f'world_size: {Utils.world_size}'
             )
-            torch.cuda.set_device(Utils.rank % torch.cuda.device_count())
+            torch.cuda.set_device(Utils.rank % device_count)
             init_method = 'tcp://'
             master_ip = os.getenv('MASTER_ADDR', 'localhost')
             master_port = os.getenv('MASTER_PORT', '6000')

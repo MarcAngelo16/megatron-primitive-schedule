@@ -4,7 +4,6 @@
 
 import hashlib
 import json
-import sys
 from dataclasses import replace
 from types import SimpleNamespace
 
@@ -15,7 +14,6 @@ from megatron.core.pipeline_parallel.slackpipe import communication, communicati
 from megatron.core.pipeline_parallel.slackpipe.cost_profile import build_heterogeneous_cost_profile
 from megatron.core.pipeline_parallel.slackpipe.hybrid import (
     NEMOTRON_H_8B_PATTERN,
-    bind_hybrid_config,
     nemotron_h_8b_config,
     partition_hybrid_pattern,
     stage_class_counts,
@@ -211,40 +209,6 @@ def test_hybrid_args_manifest_and_prefix_costs(tmp_path):
     ) == (4096, 21504, 32, 8)
     assert [l["global_layer_id"] for l in manifest["layers"]] == list(range(52))
     assert {l["layer_type"] for l in manifest["layers"]} == {"mamba", "attention", "mlp"}
-
-
-@pytest.mark.parametrize("action", ["baseline", "slackpipe"])
-def test_nemotron_launch_arguments(monkeypatch, tmp_path, action):
-    from megatron.training.arguments import (
-        core_transformer_config_from_args,
-        parse_args,
-        validate_args,
-    )
-    from tools.slackpipe_hybrid import launch_command
-
-    payload = hybrid_plan()
-    payload.update(
-        num_layers=52,
-        layer_cuts=[52 * s // 8 for s in range(9)],
-        model_manifest_hash=build_model_manifest(nemotron_h_8b_config())["manifest_hash"],
-    )
-    path = tmp_path / "nemotron.plan.json"
-    path.write_text(json.dumps(payload))
-    options = SimpleNamespace(
-        action=action, seq_length=64, output=tmp_path, plan=path, transport="nccl-p2p"
-    )
-    command = launch_command(options)
-    monkeypatch.setattr(sys, "argv", command[command.index("pretrain_hybrid.py") :])
-    monkeypatch.setenv("WORLD_SIZE", "4")
-    monkeypatch.setenv("RANK", "0")
-    args = validate_args(parse_args())
-    assert args.virtual_pipeline_model_parallel_size == 2
-    assert args.bf16 and args.params_dtype == torch.bfloat16
-    assert args.pipeline_model_parallel_layout is None
-    assert len(args.hybrid_layer_pattern.split("|")) == 8
-    config = bind_hybrid_config(core_transformer_config_from_args(args), args.hybrid_layer_pattern)
-    assert config.deallocate_pipeline_outputs == (action == "baseline")
-    assert build_model_manifest(config) == build_model_manifest(nemotron_h_8b_config())
 
 
 @pytest.mark.parametrize("microbatches", [1, 4, 8, 16])

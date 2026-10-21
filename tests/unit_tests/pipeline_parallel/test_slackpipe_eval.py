@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from tools.run_slackpipe_eval import benchmark_summary, memory_preflight, receipt_valid
+from tools.run_slackpipe_eval import benchmark_summary, memory_preflight
 from tools.run_slackpipe_real_system_campaign import rotated_orders
 from tools.slackpipe_eval_config import (
     fingerprint,
@@ -17,9 +17,10 @@ from tools.slackpipe_eval_config import (
     transformer_config,
     validate_model,
 )
+from tools.slackpipe_eval_receipts import receipt_valid
 from tools.slackpipe_eval_tables import benefits, export_tables, latex_model_table
 from tools.slackpipe_eval_worker import validate_profile
-from tools.slackpipe_nemotron_worker import construction_plan, uniform_cuts
+from tools.slackpipe_training import construction_plan, uniform_cuts
 
 CONFIGS = Path(__file__).resolve().parents[3] / "configs/slackpipe_eval"
 
@@ -38,7 +39,7 @@ def test_octopipe_cli_exports_executable_plan(tmp_path):
         [
             str(cli),
             "--algorithm",
-            "octopipe-algorithm1-fixed-stage",
+            "octopipe-tuning",
             "--B",
             "4",
             "--N",
@@ -53,9 +54,7 @@ def test_octopipe_cli_exports_executable_plan(tmp_path):
             "1",
             "--communication",
             "0",
-            "--octopipe-fixed-placement",
-            "true",
-            "--time-limit-seconds",
+            "--time-limit",
             "0.1",
             "--output-prefix",
             str(tmp_path / "solver"),
@@ -68,7 +67,7 @@ def test_octopipe_cli_exports_executable_plan(tmp_path):
         timeout=30,
     )
     subprocess.run(
-        [str(cli), "validate-result", "--input", str(tmp_path / "solver.json")],
+        [str(cli), "--validate-result", str(tmp_path / "solver.json")],
         check=True,
         capture_output=True,
         text=True,
@@ -139,7 +138,7 @@ def test_schema_rejects_missing_and_mislabelled():
 @pytest.mark.parametrize("b", [4, 8, 16])
 @pytest.mark.parametrize("n", [4, 8, 12])
 def test_generic_topology_and_coverage(b, n):
-    topology = schedule_topology("slackpipe", 4, n, b)
+    topology = schedule_topology("slack-heuristic", 4, n, b)
     assert topology["vpp"] == (None if n == 4 else n // 4)
     model = load_model(CONFIGS / "llama_4b.json")
     from megatron.core.pipeline_parallel.slackpipe.manifest import build_model_manifest
@@ -150,53 +149,16 @@ def test_generic_topology_and_coverage(b, n):
     assert plan.stage_to_worker == tuple(s % 4 for s in range(n))
 
 
-def test_schedule_routing():
-    from tools.slackpipe_eval_config import COMPARISON_SCHEDULES, execution_mode
-
-    assert COMPARISON_SCHEDULES == (
-        "1f1b",
-        "interleaved",
-        "octopipe",
-        "slackpipe",
-        "slackpipe-refined",
-    )
-    assert execution_mode("octopipe") == "slackpipe"
-    assert execution_mode("slackpipe-refined") == "slackpipe"
-    refined = schedule_topology("slackpipe-refined", 4, 8, 8)
-    assert (refined["base_N"], refined["num_stages"], refined["vpp"]) == (8, 12, 3)
-    with pytest.raises(ValueError, match="N % PP"):
-        schedule_topology("slackpipe-refined", 4, 7, 8)
-    assert schedule_topology("1f1b-interleave", 4, 8, 8) == schedule_topology(
-        "interleaved", 4, 8, 8
-    )
-    from megatron.core.pipeline_parallel.schedules import get_forward_backward_func
-
-    assert (
-        get_forward_backward_func(pp_size=4, vp_size=None).__name__
-        == "forward_backward_pipelining_without_interleaving"
-    )
-    assert (
-        get_forward_backward_func(pp_size=4, vp_size=2).__name__
-        == "forward_backward_pipelining_with_interleaving"
-    )
-    assert (
-        get_forward_backward_func(
-            pipeline_schedule="slackpipe", slackpipe_plan_path="unused"
-        ).func.__name__
-        == "forward_backward_slackpipe"
-    )
-    with pytest.raises(ValueError):
-        schedule_topology("1f1b", 4, 8, 8)
-    with pytest.raises(ValueError):
-        schedule_topology("slackpipe", 4, 10, 8)
-
-
 def test_receipts_and_campaign_order(tmp_path):
-    from tools.run_slackpipe_nemotron_h8b_pp4 import digest
+    from tools.slackpipe_eval_common import digest
 
     p = tmp_path / "artifact.json"
     p.write_text("{}")
-    receipt = dict(context={"seed": 1}, artifacts={p.name: digest(p)})
+    receipt = dict(
+        schema_version="slackpipe.eval_receipt.v4",
+        context={"seed": 1},
+        artifacts={p.name: digest(p)},
+    )
     assert receipt_valid(receipt, {"seed": 1}, tmp_path)
     receipt["context"]["nccl"] = [2, 29, 7]
     assert receipt_valid(receipt, {"seed": 1, "nccl": (2, 29, 7)}, tmp_path)
@@ -204,8 +166,8 @@ def test_receipts_and_campaign_order(tmp_path):
     assert not receipt_valid(receipt, {"seed": 2}, tmp_path)
     p.write_text("changed")
     assert not receipt_valid(receipt, {"seed": 1}, tmp_path)
-    orders = rotated_orders(["1f1b", "interleaved", "slackpipe"], 3, 10)
-    assert orders == rotated_orders(["1f1b", "interleaved", "slackpipe"], 3, 10)
+    orders = rotated_orders(["1f1b", "interleaved-1f1b", "slack-heuristic"], 3, 10)
+    assert orders == rotated_orders(["1f1b", "interleaved-1f1b", "slack-heuristic"], 3, 10)
     assert len({o[0] for o in orders}) == 3
 
 
@@ -214,7 +176,7 @@ def test_memory_gate_does_not_shrink():
     original = copy.deepcopy(model)
     report = memory_preflight(
         model,
-        schedule_topology("slackpipe", 4, 8, 8),
+        schedule_topology("slack-heuristic", 4, 8, 8),
         "bf16",
         1024,
         1,
@@ -225,11 +187,11 @@ def test_memory_gate_does_not_shrink():
 
 
 def test_profile_rejects_mismatch(tmp_path):
-    from megatron.core.pipeline_parallel.slackpipe.profile_quality import publish_profile
+    from megatron.core.pipeline_parallel.slackpipe.profile_integrity import publish_profile
     from tests.unit_tests.pipeline_parallel.test_slackpipe_profile_quality import stable_profile
 
     model = tiny_model("llama")
-    topology = schedule_topology("interleaved", 2, 4, 4)
+    topology = schedule_topology("interleaved-1f1b", 2, 4, 4)
     profile = dict(
         model_config=dict(
             model_config_hash=fingerprint(model),
@@ -240,7 +202,10 @@ def test_profile_rejects_mismatch(tmp_path):
         parallel_config={k: topology[k] for k in ("pp", "vpp", "tp", "dp", "cp")},
     )
     profile.update(stable_profile())
-    publish_profile(tmp_path / "cost_profile.json", profile)
+    profile["bias_fwd"] = profile["bias_bwd"] = [0.0] * topology["num_stages"]
+    profile["calibration_partition"] = [2] * topology["num_stages"]
+    path = publish_profile(tmp_path / "cost_profile.json", profile)
+    profile = json.loads(path.read_text())
     validate_profile(profile, model, topology, "fp32", 32, 1)
     for precision, seq, micro in (("bf16", 32, 1), ("fp32", 64, 1), ("fp32", 32, 2)):
         with pytest.raises(ValueError, match="mismatch"):
@@ -248,7 +213,7 @@ def test_profile_rejects_mismatch(tmp_path):
 
 
 def test_v1_binding_rejects_changed_profile(tmp_path):
-    from tools.run_slackpipe_nemotron_h8b_pp4 import digest
+    from tools.slackpipe_eval_common import digest
     from tools.slackpipe_eval_worker import validate_plan_provenance
 
     profile = tmp_path / "profile.json"
@@ -273,19 +238,24 @@ def test_v1_binding_rejects_changed_profile(tmp_path):
 
 
 def test_experiment_resume_never_launches_matching_stage(tmp_path, monkeypatch):
+    import torch
+
     from tools.run_slackpipe_eval import Experiment, argument_parser
-    from tools.run_slackpipe_nemotron_h8b_pp4 import digest
+    from tools.slackpipe_eval_common import digest
 
     config = tmp_path / "config.json"
     config.write_text(json.dumps(tiny_model("llama")))
     args = argument_parser().parse_args(
         [
+            "--phase",
             "env",
+            "--num-stages",
+            "2",
             "--model-config",
             str(config),
             "--output",
             str(tmp_path),
-            "--schedule",
+            "--method",
             "1f1b",
             "--pp",
             "2",
@@ -293,12 +263,15 @@ def test_experiment_resume_never_launches_matching_stage(tmp_path, monkeypatch):
         ]
     )
     exp = Experiment(args)
+    monkeypatch.setattr(exp, "_base_context", lambda: dict(environment={"fixture": True}))
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 2)
     monkeypatch.setattr(exp, "_execute", lambda *args: pytest.fail("resume launched a subprocess"))
     receipts = tmp_path / "receipts"
     receipts.mkdir()
     context = exp._context("env", {})
     receipt = dict(
-        schema_version="slackpipe.eval_receipt.v2",
+        schema_version="slackpipe.eval_receipt.v4",
         status="passed",
         stage="env",
         context=context,
@@ -313,74 +286,6 @@ def test_experiment_resume_never_launches_matching_stage(tmp_path, monkeypatch):
         exp.ensure("env")
 
 
-def test_comparison_panels_and_capture_policy(tmp_path):
-    from megatron.core.pipeline_parallel.slackpipe.figure_trace import write_compact_trace
-    from tests.unit_tests.pipeline_parallel.test_slackpipe_figure_trace import compact
-    from tools.plot_schedule_trace import load_panel, render
-
-    for rank in range(2):
-        write_compact_trace(tmp_path / f"rank{rank}_trace.json", compact(rank))
-    panel = load_panel(tmp_path, 5)
-    panel["config"].update(
-        num_layers=8,
-        hidden_size=128,
-        heads=4,
-        seq_length=32,
-        micro_batch_size=1,
-        vocab_size=128,
-        seed=1234,
-        learning_rate=0.001,
-        dtype="fp32",
-        tf32=False,
-        dropout=0,
-        tp=1,
-        dp=1,
-        cp=1,
-        model="fixture",
-        model_sha256="same",
-    )
-    panel["collection"] = dict(
-        profiler={},
-        active_iterations=[5],
-        cycle=0,
-        environment={
-            k: None for k in ("allocator_environment", "allocator_backend", "torch", "cuda", "nccl")
-        },
-    )
-    native, inter, slack = [copy.deepcopy(panel) for _ in range(3)]
-    native["mode"], inter["mode"], slack["mode"] = "1f1b", "interleaved", "slackpipe"
-    inter["config"]["num_stages"] = slack["config"]["num_stages"] = 4
-    options = dict(
-        png=tmp_path / "plot.png",
-        pdf=tmp_path / "plot.pdf",
-        title="fixture",
-        caption="unlabeled gaps are not proven idle",
-        color_mode="microbatch",
-        annotate_saved=False,
-    )
-    report = render(inter, slack, noninterleaved=native, **options)
-    assert report["noninterleaved"]["iteration"] == 5
-    assert (tmp_path / "plot.pdf").stat().st_size > 0
-    octo = copy.deepcopy(slack)
-    octo["mode"] = "octopipe"
-    report = render(inter, slack, noninterleaved=native, octopipe=octo, **options)
-    assert report["octopipe"]["iteration"] == report["slackpipe"]["iteration"] == 5
-    refined = copy.deepcopy(slack)
-    refined["mode"] = "slackpipe-refined"
-    refined["config"].update(num_stages=6, base_N=4, effective_N=6)
-    report = render(inter, slack, noninterleaved=native, octopipe=octo, refined=refined, **options)
-    assert report["refined"]["config"]["num_stages"] == 6
-    refined["config"]["num_stages"] = 4
-    with pytest.raises(ValueError, match="N\\+W"):
-        render(inter, slack, refined=refined, **options)
-    octo["collection"]["cycle"] = 1
-    with pytest.raises(ValueError, match="capture"):
-        render(inter, slack, noninterleaved=native, octopipe=octo, **options)
-    native["collection"]["cycle"] = 1
-    with pytest.raises(ValueError, match="capture"):
-        render(inter, slack, noninterleaved=native, **options)
-
-
 def test_tables_are_from_configs(tmp_path):
     paths = sorted(CONFIGS.glob("*.json"))
     table = latex_model_table([load_model(p) for p in paths])
@@ -389,12 +294,14 @@ def test_tables_are_from_configs(tmp_path):
     export_tables(tmp_path, paths)
     assert len(json.loads((tmp_path / "model_configs.json").read_text())) == 8
     assert (tmp_path / "memory_summary.csv").is_file()
-    assert benefits({"1f1b": 10, "interleaved": 8, "slackpipe": 6}) == dict(
-        slackpipe_vs_1f1b=0.4, interleaving_benefit=0.2, slackpipe_vs_interleaved=0.25
-    )
-    assert benefits({"1f1b": 10, "interleaved": 8, "octopipe": 7, "slackpipe": 6})[
-        "slackpipe_vs_octopipe"
-    ] == pytest.approx(1 / 7)
+    assert benefits({"1f1b": 10, "interleaved-1f1b": 8, "slack-heuristic": 6}) == {
+        "slack-heuristic_vs_1f1b": 0.4,
+        "interleaved-1f1b_vs_1f1b": 0.2,
+        "slack-heuristic_vs_interleaved-1f1b": 0.25,
+    }
+    assert benefits(
+        {"1f1b": 10, "interleaved-1f1b": 8, "octopipe-tuning": 7, "slack-heuristic": 6}
+    )["slack-heuristic_vs_octopipe-tuning"] == pytest.approx(1 / 7)
 
 
 def test_benchmark_summary_raw_agreement():
@@ -411,16 +318,30 @@ def test_benchmark_summary_raw_agreement():
         )
 
     summary = benchmark_summary([[result(0, [10, 20]), result(1, [12, 18])]], 8, 1024)
-    assert summary["all_samples_by_run"] == [[12, 20]]
-    assert summary["mean_ms"] == 16 and summary["ci95_ms"] is None
+    assert summary["schema_version"] == "slackpipe.eval_benchmark.v2"
+    assert summary["all_samples_by_run"] == [[20]]
+    assert summary["mean_ms"] == 20 and summary["ci95_ms"] is None
+    assert summary["cuda_event_summary"]["all_samples_by_run"] == [[12, 20]]
+    assert summary["cuda_event_summary"]["mean_ms"] == 16
+    assert summary["cuda_event_summary"]["ci95_ms"] is None
     assert summary["tokens_per_second"] == 8 * 1024 * 1000 / 20
+
+    second = [result(0, [100, 200]), result(1, [120, 180])]
+    for rank in second:
+        rank["run_id"] = "second"
+        rank["continuous_wall_ms"] = 80
+    repeated = benchmark_summary([[result(0, [10, 20]), result(1, [12, 18])], second], 8, 1024)
+    assert repeated["all_samples_by_run"] == [[20], [40]]
+    assert repeated["mean_ms"] == repeated["continuous_mean_ms"] == 30
+    assert repeated["ci95_ms"] == repeated["continuous_ci95_ms"]
+    assert repeated["ci95_ms"] == pytest.approx(19.6)
+    assert repeated["cuda_event_summary"]["mean_ms"] == 88
+    assert repeated["tokens_per_second"] == 8 * 1024 * 1000 / 30
 
 
 @pytest.mark.parametrize("family", ["llama", "nemotron_h"])
 def test_exact_count_matches_instantiated_model(family):
     import os
-
-    import torch
 
     if int(os.environ.get("WORLD_SIZE", "1")) != 1:
         pytest.skip("parameter-count reference construction requires one rank")

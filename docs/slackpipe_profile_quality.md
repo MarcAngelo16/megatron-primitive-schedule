@@ -1,4 +1,11 @@
-# Calibration Quality Gate
+# Historical Calibration Quality Gate
+
+> Superseded by the [current profiling contract](slackpipe_profiling.md).
+> The stability gates, group consensus, raw spike rules, quality receipts and
+> automatic retries described below are historical and are not current behavior.
+> Current stage profiling uses one affine-residual mask; layer profiling retains
+> all legal samples. The original measurements, paths, counts and audit narrative
+> below are preserved as historical evidence, not new validation or instructions.
 
 Calibration is a separate synchronized diagnostic workload, not benchmark timing.
 Its stage-call wall time includes CPU dispatch, allocation/cache stalls, compute,
